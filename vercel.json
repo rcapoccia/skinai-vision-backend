@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/vision/:path*",
+      "destination": "https://skinai-vision-backend-production.up.railway.app/:path*"
+    }
+  ]
+}
