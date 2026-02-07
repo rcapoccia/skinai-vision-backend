@@ -48,16 +48,16 @@ def dermoscope_effect(image_bytes: bytes) -> tuple:
     # 1. CROSS-POLARIZZAZIONE (riduce riflessi superficiali, rivela sub-surface)
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l_enhanced = clahe.apply(l)
 
     # 2. UNSHARP MASK micro-texture (rivela rughe/pori nascosti)
     gaussian = cv2.GaussianBlur(l_enhanced, (0, 0), 2.0)
-    unsharp = cv2.addWeighted(l_enhanced, 1.5, gaussian, -0.5, 0)
+    unsharp = cv2.addWeighted(l_enhanced, 1.3, gaussian, -0.3, 0)
 
     # 3. HUE BOOST sub-skin (pori verdi, vasi blu diventano più visibili)
-    a_boosted = np.clip(a.astype(np.float32) * 1.2, 0, 255).astype(np.uint8)
-    b_boosted = np.clip(b.astype(np.float32) * 1.1, 0, 255).astype(np.uint8)
+    a_boosted = np.clip(a.astype(np.float32) * 1.15, 0, 255).astype(np.uint8)
+    b_boosted = np.clip(b.astype(np.float32) * 1.08, 0, 255).astype(np.uint8)
     lab_derm = cv2.merge([unsharp, a_boosted, b_boosted])
 
     # 4. DENOISE peli/fine noise
@@ -310,29 +310,51 @@ SCALA BEAUTY INVERTITA (100=perfetto, 0=problematico):
 - Acne: 100=flawless skin-like, 70=pochi imperfezioni minime, 40=acne moderata green primer, 0=severe active acne
 - pelle_pulita_percent: % ready natural makeup (media dei 6 scores sopra)
 
-IMPORTANTE - BIAS FIX:
-- NON sovrastimare occhiaie: valuta SOLO colorazione blu/viola sotto l'occhio + puffiness. Le ombre naturali da illuminazione NON sono occhiaie.
-- Per donne 30-45 con pelle sana: occhiaie dovrebbero essere 70-85 (non 45-55).
-- Per donne 60+: rughe 25-35 è corretto, ma pori spesso restano alti (80+).
-- Acne=100 se non ci sono lesioni attive (comedoni, papule, pustole). Texture normale NON è acne.
+IMPORTANTE - REGOLE GENERALI DI CALIBRAZIONE:
+
+OCCHIAIE - Regola per età:
+- Pelle giovane (20-35): occhiaie sono rare. Solo colorazione blu/viola evidente = score basso. Ombre da illuminazione NON contano. Range tipico: 75-90.
+- Pelle media (35-50): lievi occhiaie sono normali. Solo se visibilmente scure/gonfie = score basso. Range tipico: 65-80.
+- Pelle matura (50-65): occhiaie moderate sono comuni (pelle più sottile, vasi più visibili). Range tipico: 50-65.
+- Pelle anziana (65+): occhiaie moderate-marcate sono fisiologiche. Pelle sottile perioculare mostra vasi. Range tipico: 40-55.
+
+MACCHIE - Regola di severità:
+- Pelle con tono quasi uniforme e solo lievissime variazioni naturali di colore (lentiggini sparse, lieve rossore) = 85-95, NON 70-75.
+- Score sotto 70 SOLO se ci sono discromie chiaramente visibili (macchie solari definite, melasma, iperpigmentazione post-infiammatoria).
+- Lentiggini leggere e uniformi NON sono macchie problematiche.
+
+DISIDRATAZIONE - Regola di valutazione:
+- 100=pelle luminosa, dewy, turgida (glow visibile).
+- 70=pelle ok ma senza glow particolare, leggermente opaca.
+- 50-60=pelle visibilmente opaca, manca luminosità, texture leggermente ruvida.
+- Sotto 40=pelle secca evidente, desquamazione, linee di disidratazione.
+- Se la pelle appare opaca e senza luminosità ma non secca = 55-65, NON 70+.
+
+PORI - Regola generale:
+- Pori poco visibili = 75-85 indipendentemente dall'età.
+- Score sotto 60 SOLO se pori chiaramente dilatati e visibili (tipico pelle grassa/mista zona T).
+
+ACNE:
+- 100 se non ci sono lesioni attive (comedoni, papule, pustole). Texture normale NON è acne.
+- 95 se ci sono 1-2 micro-imperfezioni appena visibili.
 
 ESEMPI BEAUTY ADVISOR (few-shot):
 
-Es1 [donna 40, linee leggere, pelle curata]:
-Valutazione: Buona base, pelle luminosa, linee sottili normali per età, occhiaie makeup-fixable con light corrector.
-{"rughe":70,"pori":80,"macchie":85,"occhiaie":75,"disidratazione":70,"acne":95,"pelle_pulita_percent":79}
+Es1 [donna 40, linee leggere, pelle curata, lieve opacità]:
+Valutazione: Pelle discreta, linee sottili normali per età. Tono quasi uniforme con variazioni minime. Pelle leggermente opaca (non dewy). Occhiaie appena percettibili. Pori quasi invisibili.
+{"rughe":72,"pori":82,"macchie":88,"occhiaie":75,"disidratazione":60,"acne":95,"pelle_pulita_percent":79}
 
-Es2 [donna 70, rughe profonde, macchie solari]:
-Valutazione: Heavy coverage base needed. Rughe profonde fronte e naso-labiali. Macchie solari moderate. Pori sorprendentemente fini.
-{"rughe":25,"pori":85,"macchie":55,"occhiaie":50,"disidratazione":35,"acne":95,"pelle_pulita_percent":58}
+Es2 [donna 70, rughe profonde, macchie moderate, pelle secca]:
+Valutazione: Rughe profonde fronte e naso-labiali. Alcune discromie/macchie solari. Pori poco visibili. Occhiaie moderate (pelle sottile, vasi visibili). Pelle opaca e poco elastica.
+{"rughe":20,"pori":80,"macchie":50,"occhiaie":45,"disidratazione":30,"acne":100,"pelle_pulita_percent":54}
 
 Es3 [ragazza 20, acne attiva, pori dilatati]:
-Valutazione: Green primer + light coverage. Acne attiva su guance. Pori dilatati zona T. Pelle giovane, buona elasticità.
-{"rughe":95,"pori":35,"macchie":55,"occhiaie":80,"disidratazione":70,"acne":30,"pelle_pulita_percent":61}
+Valutazione: Acne attiva su guance. Pori dilatati zona T. Pelle giovane, buona elasticità e idratazione. Tono con segni post-acne. Occhiaie quasi assenti.
+{"rughe":95,"pori":35,"macchie":60,"occhiaie":85,"disidratazione":75,"acne":30,"pelle_pulita_percent":63}
 
-Es4 [uomo 45, pelle matura ma curata]:
-Valutazione: Rughe moderate fronte e crow feet. Pelle ben idratata. Nessuna acne. Lieve discromia.
-{"rughe":55,"pori":70,"macchie":75,"occhiaie":65,"disidratazione":60,"acne":100,"pelle_pulita_percent":71}"""
+Es4 [uomo 45, pelle matura ma curata, lieve disidratazione]:
+Valutazione: Rughe moderate fronte e crow feet. Pelle leggermente opaca. Nessuna acne. Tono abbastanza uniforme. Occhiaie lievi normali per età.
+{"rughe":55,"pori":75,"macchie":80,"occhiaie":68,"disidratazione":58,"acne":100,"pelle_pulita_percent":73}"""
 
 
 BEAUTY_PROMPT_DERMOSCOPE = """Sei beauty advisor PRO con dermoscopio. Analizza questa foto DERMOSCOPICA (polarizzata, sub-cutanea).
@@ -357,21 +379,24 @@ BEAUTY SCALE 0-100 (100=perfetta, 0=problematico):
 - Acne: 100=flawless sub-cutaneo, 70=micro-comedoni sub-skin, 40=infiammazione sub-cutanea, 0=active inflammatory deep
 - pelle_pulita_percent: % ready natural makeup (media dei 6 scores)
 
-IMPORTANTE - DERMOSCOPIA vs SELFIE:
-- In dermoscopia TUTTO è più visibile. Scores tendono ad essere 5-15 punti più bassi del selfie normale.
-- Una donna 40 con pelle "perfetta" in selfie avrà rughe=70-75 in dermoscopia (micro-rughe normali).
-- NON dare scores troppo bassi: micro-rughe e micro-pori sono NORMALI in dermoscopia.
+IMPORTANTE - DERMOSCOPIA vs SELFIE (REGOLE GENERALI):
+- La dermoscopia rivela dettagli nascosti, ma NON inventa problemi che non esistono.
+- Scores dermoscopici sono tipicamente 5-10 punti più bassi del selfie per pelle giovane, 10-15 per pelle matura.
+- MAI più di 20 punti di differenza rispetto al selfie normale sullo stesso parametro.
+- Pori poco visibili in selfie restano relativamente poco visibili in dermoscopia (score 70-80, NON 40-50).
+- Micro-rughe e micro-pori visibili SOLO in dermoscopia sono NORMALI e fisiologici: non abbassare troppo lo score.
+- Occhiaie: la dermoscopia mostra la rete vascolare, ma vasi lievi sono normali. Stessa logica per età del prompt standard.
 
 ESEMPI DERMOSCOPIA:
 
 Es1 [donna 40, pelle curata, dermoscopia]:
-{"rughe":72,"pori":78,"macchie":80,"occhiaie":68,"disidratazione":65,"acne":95,"pelle_pulita_percent":76}
+{"rughe":65,"pori":75,"macchie":82,"occhiaie":68,"disidratazione":55,"acne":95,"pelle_pulita_percent":73}
 
 Es2 [donna 70, dermoscopia]:
-{"rughe":20,"pori":82,"macchie":48,"occhiaie":45,"disidratazione":30,"acne":92,"pelle_pulita_percent":53}
+{"rughe":15,"pori":75,"macchie":42,"occhiaie":40,"disidratazione":25,"acne":95,"pelle_pulita_percent":49}
 
 Es3 [ragazza 20, acne, dermoscopia]:
-{"rughe":92,"pori":30,"macchie":50,"occhiaie":75,"disidratazione":65,"acne":25,"pelle_pulita_percent":56}
+{"rughe":90,"pori":30,"macchie":55,"occhiaie":80,"disidratazione":68,"acne":25,"pelle_pulita_percent":58}
 
 Valutazione dermoscopica breve, poi JSON esatto:
 {"rughe":<0-100>,"pori":<0-100>,"macchie":<0-100>,"occhiaie":<0-100>,"disidratazione":<0-100>,"acne":<0-100>,"pelle_pulita_percent":<0-100>}
@@ -531,7 +556,7 @@ def build_extras(scores: dict, quiz_data: dict) -> dict:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": "Groq Maverick + Dermoscopio Virtuale", "version": "3.0"}
+    return {"status": "ok", "engine": "Groq Maverick + Dermoscopio Virtuale", "version": "3.1"}
 
 
 @app.post("/analyze")
