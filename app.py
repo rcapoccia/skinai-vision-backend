@@ -5,8 +5,10 @@ import io
 import re
 import json
 import os
+import numpy as np
+import cv2
 
-app = FastAPI(title="SkinGlow AI Vision Backend")
+app = FastAPI(title="SkinGlow AI - Beauty Advisor + Dermoscopio")
 
 # CORS configuration
 app.add_middleware(
@@ -24,21 +26,65 @@ def get_groq_client():
 
 
 # ============================================================
+# DERMOSCOPIO VIRTUALE (OpenCV)
+# ============================================================
+
+def dermoscope_effect(image_bytes: bytes) -> tuple:
+    """
+    Simula un dermoscopio virtuale con tecniche di imaging avanzate:
+    1. Cross-polarizzazione simulata (CLAHE su canale L)
+    2. Unsharp mask per micro-texture (rughe/pori nascosti)
+    3. Hue boost sub-cutaneo (pori, vasi)
+    4. Denoise per rimuovere rumore fine
+    Restituisce: (derm_bytes, derm_base64)
+    """
+    # Decode immagine
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        raise ValueError("Impossibile decodificare l'immagine")
+
+    # 1. CROSS-POLARIZZAZIONE (riduce riflessi superficiali, rivela sub-surface)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l_enhanced = clahe.apply(l)
+
+    # 2. UNSHARP MASK micro-texture (rivela rughe/pori nascosti)
+    gaussian = cv2.GaussianBlur(l_enhanced, (0, 0), 2.0)
+    unsharp = cv2.addWeighted(l_enhanced, 1.5, gaussian, -0.5, 0)
+
+    # 3. HUE BOOST sub-skin (pori verdi, vasi blu diventano più visibili)
+    a_boosted = np.clip(a.astype(np.float32) * 1.2, 0, 255).astype(np.uint8)
+    b_boosted = np.clip(b.astype(np.float32) * 1.1, 0, 255).astype(np.uint8)
+    lab_derm = cv2.merge([unsharp, a_boosted, b_boosted])
+
+    # 4. DENOISE peli/fine noise
+    img_derm = cv2.cvtColor(lab_derm, cv2.COLOR_LAB2BGR)
+    img_derm = cv2.medianBlur(img_derm, 3)
+
+    # Encode per Groq
+    _, derm_buffer = cv2.imencode('.jpg', img_derm, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    derm_bytes = derm_buffer.tobytes()
+
+    # Base64 per frontend debug
+    derm_b64 = base64.b64encode(derm_bytes).decode()
+
+    return derm_bytes, derm_b64
+
+
+# ============================================================
 # ARMOCROMIA ENGINE
 # ============================================================
 
 def calcola_armocromia(questionnaire: dict) -> dict:
-    """
-    Calcola la stagione armocromia basata sulle risposte del questionario.
-    Usa: colore capelli, colore occhi, vene polso, abbronzatura.
-    Restituisce: stagione, sottotono, palette colori, consigli makeup.
-    """
+    """Calcola la stagione armocromia basata sulle risposte del questionario."""
     punti_caldo = 0
     punti_freddo = 0
     intensita_alta = 0
     intensita_bassa = 0
 
-    # Vene polso (indicatore più affidabile)
     vene = questionnaire.get("vene_polso", "")
     if "Verdi" in vene:
         punti_caldo += 3
@@ -48,7 +94,6 @@ def calcola_armocromia(questionnaire: dict) -> dict:
         punti_caldo += 1
         punti_freddo += 1
 
-    # Abbronzatura
     abbronzatura = questionnaire.get("abbronzatura", "")
     if "dorata" in abbronzatura.lower() or "facile" in abbronzatura.lower():
         punti_caldo += 2
@@ -57,7 +102,6 @@ def calcola_armocromia(questionnaire: dict) -> dict:
     elif "non mi" in abbronzatura.lower():
         punti_freddo += 1
 
-    # Colore capelli
     capelli = questionnaire.get("hair_color", "").lower()
     if any(c in capelli for c in ["rosso", "ramato", "castano scuro"]):
         punti_caldo += 1
@@ -70,7 +114,6 @@ def calcola_armocromia(questionnaire: dict) -> dict:
     elif "biondo scuro" in capelli or "castano chiaro" in capelli:
         intensita_bassa += 1
 
-    # Colore occhi
     occhi = questionnaire.get("eye_color", "").lower()
     if any(c in occhi for c in ["marrone scuro", "nero"]):
         intensita_alta += 1
@@ -81,60 +124,32 @@ def calcola_armocromia(questionnaire: dict) -> dict:
     elif any(c in occhi for c in ["verde", "nocciola", "marrone chiaro"]):
         punti_caldo += 1
 
-    # Determina sottotono
     sottotono = "Caldo" if punti_caldo > punti_freddo else "Freddo" if punti_freddo > punti_caldo else "Neutro"
 
-    # Determina stagione
     if sottotono == "Caldo":
         if intensita_alta >= intensita_bassa:
             stagione = "Autunno"
             sotto_stagione = "Autunno Caldo"
             palette = ["Terracotta", "Arancio bruciato", "Oro antico", "Verde oliva", "Marrone cioccolato", "Senape"]
-            makeup = {
-                "fondotinta": "Sottotono dorato/pesca",
-                "blush": "Pesca, terracotta",
-                "labbra": "Nude caldo, mattone, arancio bruciato",
-                "occhi": "Bronzo, rame, verde oliva, marrone caldo"
-            }
+            makeup = {"fondotinta": "Sottotono dorato/pesca", "blush": "Pesca, terracotta", "labbra": "Nude caldo, mattone, arancio bruciato", "occhi": "Bronzo, rame, verde oliva, marrone caldo"}
         else:
             stagione = "Primavera"
             sotto_stagione = "Primavera Calda"
             palette = ["Pesca", "Corallo", "Oro chiaro", "Verde mela", "Azzurro caldo", "Avorio"]
-            makeup = {
-                "fondotinta": "Sottotono pesca/dorato chiaro",
-                "blush": "Pesca chiaro, corallo",
-                "labbra": "Corallo, pesca, rosa caldo",
-                "occhi": "Pesca, oro chiaro, verde chiaro, marrone chiaro"
-            }
+            makeup = {"fondotinta": "Sottotono pesca/dorato chiaro", "blush": "Pesca chiaro, corallo", "labbra": "Corallo, pesca, rosa caldo", "occhi": "Pesca, oro chiaro, verde chiaro, marrone chiaro"}
     else:
         if intensita_alta >= intensita_bassa:
             stagione = "Inverno"
             sotto_stagione = "Inverno Freddo"
             palette = ["Nero", "Bianco puro", "Fucsia", "Blu royal", "Rosso ciliegia", "Argento"]
-            makeup = {
-                "fondotinta": "Sottotono rosa/neutro freddo",
-                "blush": "Rosa freddo, berry",
-                "labbra": "Rosso ciliegia, fucsia, berry, rosa freddo",
-                "occhi": "Grigio, argento, blu navy, prugna"
-            }
+            makeup = {"fondotinta": "Sottotono rosa/neutro freddo", "blush": "Rosa freddo, berry", "labbra": "Rosso ciliegia, fucsia, berry, rosa freddo", "occhi": "Grigio, argento, blu navy, prugna"}
         else:
             stagione = "Estate"
             sotto_stagione = "Estate Fredda"
             palette = ["Rosa antico", "Lavanda", "Grigio perla", "Azzurro polvere", "Malva", "Argento chiaro"]
-            makeup = {
-                "fondotinta": "Sottotono rosa/beige freddo",
-                "blush": "Rosa antico, malva",
-                "labbra": "Rosa antico, malva, berry chiaro",
-                "occhi": "Grigio, lavanda, rosa antico, taupe"
-            }
+            makeup = {"fondotinta": "Sottotono rosa/beige freddo", "blush": "Rosa antico, malva", "labbra": "Rosa antico, malva, berry chiaro", "occhi": "Grigio, lavanda, rosa antico, taupe"}
 
-    return {
-        "stagione": stagione,
-        "sotto_stagione": sotto_stagione,
-        "sottotono": sottotono,
-        "palette_colori": palette,
-        "consigli_makeup": makeup
-    }
+    return {"stagione": stagione, "sotto_stagione": sotto_stagione, "sottotono": sottotono, "palette_colori": palette, "consigli_makeup": makeup}
 
 
 # ============================================================
@@ -142,87 +157,32 @@ def calcola_armocromia(questionnaire: dict) -> dict:
 # ============================================================
 
 PRINCIPI_ATTIVI = {
-    "Disidratazione": {
-        "attivo": "Acido Ialuronico",
-        "query_base": "acido ialuronico siero"
-    },
-    "Rughe": {
-        "attivo": "Retinolo",
-        "query_base": "retinolo crema anti rughe"
-    },
-    "Acne": {
-        "attivo": "Niacinamide",
-        "query_base": "niacinamide siero acne"
-    },
-    "Pori/Macchie": {
-        "attivo": "Vitamina C",
-        "query_base": "vitamina c siero antimacchie"
-    },
-    "Occhiaie": {
-        "attivo": "Caffeina + Vitamina K",
-        "query_base": "contorno occhi caffeina occhiaie"
-    },
-    "Sensibilità": {
-        "attivo": "Ceramidi + Centella",
-        "query_base": "crema lenitiva ceramidi pelle sensibile"
-    },
-    "Luminosità": {
-        "attivo": "Vitamina C + AHA",
-        "query_base": "vitamina c siero luminosita"
-    },
-    "Antietà": {
-        "attivo": "Retinolo + Peptidi",
-        "query_base": "retinolo peptidi anti age"
-    },
-    "Idratazione": {
-        "attivo": "Acido Ialuronico + Ceramidi",
-        "query_base": "acido ialuronico ceramidi idratante"
-    },
-    "Controllo acne": {
-        "attivo": "Acido Salicilico + Niacinamide",
-        "query_base": "acido salicilico niacinamide acne"
-    },
-    "Uniformità tono": {
-        "attivo": "Vitamina C + Niacinamide",
-        "query_base": "vitamina c niacinamide uniformante"
-    }
+    "Disidratazione": {"attivo": "Acido Ialuronico", "query_base": "acido ialuronico siero"},
+    "Rughe": {"attivo": "Retinolo", "query_base": "retinolo crema anti rughe"},
+    "Acne": {"attivo": "Niacinamide", "query_base": "niacinamide siero acne"},
+    "Pori/Macchie": {"attivo": "Vitamina C", "query_base": "vitamina c siero antimacchie"},
+    "Occhiaie": {"attivo": "Caffeina + Vitamina K", "query_base": "contorno occhi caffeina occhiaie"},
+    "Sensibilità": {"attivo": "Ceramidi + Centella", "query_base": "crema lenitiva ceramidi pelle sensibile"},
+    "Luminosità": {"attivo": "Vitamina C + AHA", "query_base": "vitamina c siero luminosita"},
+    "Antietà": {"attivo": "Retinolo + Peptidi", "query_base": "retinolo peptidi anti age"},
+    "Idratazione": {"attivo": "Acido Ialuronico + Ceramidi", "query_base": "acido ialuronico ceramidi idratante"},
+    "Controllo acne": {"attivo": "Acido Salicilico + Niacinamide", "query_base": "acido salicilico niacinamide acne"},
+    "Uniformità tono": {"attivo": "Vitamina C + Niacinamide", "query_base": "vitamina c niacinamide uniformante"}
 }
 
 def genera_link_amazon(problema: str, tipo_pelle: str, obiettivo: str = "") -> list:
     """Genera link Amazon dinamici basati su problema, tipo pelle e obiettivo."""
     prodotti = []
-
-    # Prodotto per il problema principale
     if problema in PRINCIPI_ATTIVI:
         info = PRINCIPI_ATTIVI[problema]
         query = f"{info['query_base']} pelle {tipo_pelle.lower()}"
-        prodotti.append({
-            "problema": problema,
-            "principio_attivo": info["attivo"],
-            "query": query,
-            "link_amazon": f"https://www.amazon.it/s?k={query.replace(' ', '+')}"
-        })
-
-    # Prodotto per l'obiettivo top
+        prodotti.append({"problema": problema, "principio_attivo": info["attivo"], "query": query, "link_amazon": f"https://www.amazon.it/s?k={query.replace(' ', '+')}"})
     if obiettivo and obiettivo in PRINCIPI_ATTIVI and obiettivo != problema:
         info = PRINCIPI_ATTIVI[obiettivo]
         query = f"{info['query_base']} pelle {tipo_pelle.lower()}"
-        prodotti.append({
-            "problema": obiettivo,
-            "principio_attivo": info["attivo"],
-            "query": query,
-            "link_amazon": f"https://www.amazon.it/s?k={query.replace(' ', '+')}"
-        })
-
-    # Sempre consiglia SPF
+        prodotti.append({"problema": obiettivo, "principio_attivo": info["attivo"], "query": query, "link_amazon": f"https://www.amazon.it/s?k={query.replace(' ', '+')}"})
     spf_query = f"crema solare viso SPF50 pelle {tipo_pelle.lower()}"
-    prodotti.append({
-        "problema": "Protezione solare (essenziale)",
-        "principio_attivo": "SPF 50+",
-        "query": spf_query,
-        "link_amazon": f"https://www.amazon.it/s?k={spf_query.replace(' ', '+')}"
-    })
-
+    prodotti.append({"problema": "Protezione solare (essenziale)", "principio_attivo": "SPF 50+", "query": spf_query, "link_amazon": f"https://www.amazon.it/s?k={spf_query.replace(' ', '+')}"})
     return prodotti
 
 
@@ -231,89 +191,259 @@ def genera_link_amazon(problema: str, tipo_pelle: str, obiettivo: str = "") -> l
 # ============================================================
 
 def genera_routine(scores: dict, questionnaire: dict) -> dict:
-    """Genera routine skincare personalizzata basata su scores e questionario."""
+    """Genera routine skincare personalizzata. Scala invertita: score basso = problema maggiore."""
     routine_attuale = questionnaire.get("routine_attuale", "Nessuna")
     tipo_pelle = questionnaire.get("skin_type", "Mista")
     problema = questionnaire.get("problema_principale", "")
 
-    # Routine mattina
     mattina = ["Detergente delicato"]
-
-    if scores.get("disidratazione", 0) > 40 or tipo_pelle in ["Secca", "Sensibile"]:
+    if scores.get("disidratazione", 100) < 60 or tipo_pelle in ["Secca", "Sensibile"]:
         mattina.append("Siero acido ialuronico")
-    if scores.get("macchie", 0) > 30 or problema == "Luminosità":
+    if scores.get("macchie", 100) < 70 or problema == "Luminosità":
         mattina.append("Siero vitamina C")
     mattina.append("Crema idratante")
     mattina.append("SPF 50 (sempre!)")
 
-    # Routine sera
     sera = []
     if questionnaire.get("makeup_frequency", "") in ["Quotidiano leggero", "Quotidiano completo"]:
         sera.append("Doppia detersione (olio + gel)")
     else:
         sera.append("Detergente delicato")
-
-    if scores.get("acne", 0) > 30 or tipo_pelle == "Grassa":
+    if scores.get("acne", 100) < 70 or tipo_pelle == "Grassa":
         sera.append("Tonico con niacinamide")
-    if scores.get("rughe", 0) > 40 and routine_attuale in ["Completa (sieri+SPF)", "Pro (retinolo/acidi)"]:
+    if scores.get("rughe", 100) < 60 and routine_attuale in ["Completa (sieri+SPF)", "Pro (retinolo/acidi)"]:
         sera.append("Retinolo (2-3 volte/settimana)")
-    elif scores.get("rughe", 0) > 40:
+    elif scores.get("rughe", 100) < 60:
         sera.append("Siero peptidi anti-age")
-    if scores.get("occhiaie", 0) > 30:
+    if scores.get("occhiaie", 100) < 70:
         sera.append("Contorno occhi con caffeina")
     sera.append("Crema notte nutriente")
 
-    # Settimanale
     settimanale = []
-    if scores.get("pori", 0) > 30 or tipo_pelle in ["Grassa", "Mista"]:
+    if scores.get("pori", 100) < 70 or tipo_pelle in ["Grassa", "Mista"]:
         settimanale.append("Maschera argilla (1x/settimana)")
-    if scores.get("disidratazione", 0) > 40:
+    if scores.get("disidratazione", 100) < 60:
         settimanale.append("Maschera idratante (2x/settimana)")
     if routine_attuale in ["Completa (sieri+SPF)", "Pro (retinolo/acidi)"]:
         settimanale.append("Esfoliante AHA/BHA (1-2x/settimana)")
 
-    return {
-        "mattina": mattina,
-        "sera": sera,
-        "settimanale": settimanale,
-        "nota": f"Routine calibrata per pelle {tipo_pelle.lower()}, livello {routine_attuale.lower()}"
-    }
+    return {"mattina": mattina, "sera": sera, "settimanale": settimanale, "nota": f"Routine calibrata per pelle {tipo_pelle.lower()}, livello {routine_attuale.lower()}"}
 
 
 # ============================================================
-# ENDPOINTS
+# CALIBRAZIONE QUIZ (POST-PROCESSING)
 # ============================================================
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "engine": "Groq Vision + Armocromia", "version": "2.0"}
+def calibrate_beauty_scores(scores: dict, quiz: dict) -> dict:
+    """Calibra i punteggi beauty usando le risposte del questionario. 100=perfetto, 0=problematico."""
+    calibrated = scores.copy()
 
-
-@app.post("/analyze")
-async def analyze(
-    file: UploadFile = File(...),
-    questionnaire: str = Form(default="{}")
-):
-    """
-    Analisi combinata: foto + questionario.
-    - file: foto del viso (JPG/PNG)
-    - questionnaire: JSON string con le risposte del questionario (opzionale)
-    """
+    age = quiz.get("age", 0)
     try:
-        # Parse questionario
-        try:
-            quiz_data = json.loads(questionnaire)
-        except json.JSONDecodeError:
-            quiz_data = {}
+        age = int(age)
+    except (ValueError, TypeError):
+        age = 0
 
-        # Leggi e codifica l'immagine
-        img_bytes = await file.read()
-        img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+    sleep_hours = quiz.get("sleep_hours", 7)
+    try:
+        sleep_hours = float(sleep_hours)
+    except (ValueError, TypeError):
+        sleep_hours = 7
 
-        # Costruisci il contesto dal questionario
-        contesto_utente = ""
-        if quiz_data:
-            contesto_utente = f"""
+    tipo_pelle = quiz.get("skin_type", "").lower()
+    routine = quiz.get("routine_attuale", "").lower()
+
+    # Calibrazione Occhiaie
+    if age > 0 and age < 40:
+        calibrated["occhiaie"] = min(100, calibrated["occhiaie"] + 15)
+    if sleep_hours >= 8:
+        calibrated["occhiaie"] = min(100, calibrated["occhiaie"] + 10)
+    elif sleep_hours <= 5:
+        calibrated["occhiaie"] = max(0, calibrated["occhiaie"] - 10)
+
+    # Calibrazione Disidratazione
+    if "secca" in tipo_pelle:
+        calibrated["disidratazione"] = max(0, calibrated["disidratazione"] - 15)
+    elif "grassa" in tipo_pelle:
+        calibrated["disidratazione"] = min(100, calibrated["disidratazione"] + 10)
+
+    # Calibrazione Rughe
+    if "completa" in routine or "pro" in routine:
+        calibrated["rughe"] = min(100, calibrated["rughe"] + 10)
+    if age > 60:
+        calibrated["rughe"] = max(0, calibrated["rughe"] - 10)
+
+    # Calibrazione Acne
+    if quiz.get("problema_principale", "").lower() in ["acne", "controllo acne"]:
+        calibrated["acne"] = max(0, calibrated["acne"] - 10)
+
+    # Ricalcola pelle_pulita_percent
+    fields = ["rughe", "pori", "macchie", "occhiaie", "disidratazione", "acne"]
+    for field in fields:
+        calibrated[field] = max(0, min(100, int(round(calibrated[field]))))
+    media = sum(calibrated[f] for f in fields) / len(fields)
+    calibrated["pelle_pulita_percent"] = max(0, min(100, int(round(media))))
+
+    return calibrated
+
+
+# ============================================================
+# PROMPTS
+# ============================================================
+
+BEAUTY_PROMPT_STANDARD = """Sei un beauty advisor senior (makeup artist con 15 anni di esperienza). Analizza questa foto del viso in close-up per valutare la skin-readiness per routine skincare e makeup.
+
+FOCUS ESTETICO: glow naturale, uniformità, makeup-readiness. NON sei un dermatologo medico.
+
+CHAIN OF THOUGHT:
+1. Valuta forma viso, sottotono, età percepita, illuminazione.
+2. Identifica beauty concerns (pori visibili? glow naturale? uniformità tono?)
+3. Score beauty-readiness 0-100 per ogni parametro.
+4. ANCHOR: Occhiaie SOLO se distraggono dal makeup look (ombre naturali da illuminazione NON contano).
+
+SCALA BEAUTY INVERTITA (100=perfetto, 0=problematico):
+- Rughe: 100=liscia airbrush-ready, 70=linee sottili normali, 40=rughe visibili coverage needed, 0=deep coverage required
+- Pori: 100=invisibili natural finish, 70=appena visibili, 40=visibili primer needed, 0=heavy primer required
+- Macchie: 100=tono uniforme no foundation needed, 70=lieve discromia, 40=macchie moderate concealer needed, 0=heavy concealer
+- Occhiaie: 100=fresca no corrector needed, 70=lieve ombra normale, 40=occhiaie moderate corrector needed, 0=dark heavy coverage
+- Disidratazione: 100=dewy glow naturale, 70=buona idratazione, 40=pelle opaca primer needed, 0=dull dry flaky
+- Acne: 100=flawless skin-like, 70=pochi imperfezioni minime, 40=acne moderata green primer, 0=severe active acne
+- pelle_pulita_percent: % ready natural makeup (media dei 6 scores sopra)
+
+IMPORTANTE - BIAS FIX:
+- NON sovrastimare occhiaie: valuta SOLO colorazione blu/viola sotto l'occhio + puffiness. Le ombre naturali da illuminazione NON sono occhiaie.
+- Per donne 30-45 con pelle sana: occhiaie dovrebbero essere 70-85 (non 45-55).
+- Per donne 60+: rughe 25-35 è corretto, ma pori spesso restano alti (80+).
+- Acne=100 se non ci sono lesioni attive (comedoni, papule, pustole). Texture normale NON è acne.
+
+ESEMPI BEAUTY ADVISOR (few-shot):
+
+Es1 [donna 40, linee leggere, pelle curata]:
+Valutazione: Buona base, pelle luminosa, linee sottili normali per età, occhiaie makeup-fixable con light corrector.
+{"rughe":70,"pori":80,"macchie":85,"occhiaie":75,"disidratazione":70,"acne":95,"pelle_pulita_percent":79}
+
+Es2 [donna 70, rughe profonde, macchie solari]:
+Valutazione: Heavy coverage base needed. Rughe profonde fronte e naso-labiali. Macchie solari moderate. Pori sorprendentemente fini.
+{"rughe":25,"pori":85,"macchie":55,"occhiaie":50,"disidratazione":35,"acne":95,"pelle_pulita_percent":58}
+
+Es3 [ragazza 20, acne attiva, pori dilatati]:
+Valutazione: Green primer + light coverage. Acne attiva su guance. Pori dilatati zona T. Pelle giovane, buona elasticità.
+{"rughe":95,"pori":35,"macchie":55,"occhiaie":80,"disidratazione":70,"acne":30,"pelle_pulita_percent":61}
+
+Es4 [uomo 45, pelle matura ma curata]:
+Valutazione: Rughe moderate fronte e crow feet. Pelle ben idratata. Nessuna acne. Lieve discromia.
+{"rughe":55,"pori":70,"macchie":75,"occhiaie":65,"disidratazione":60,"acne":100,"pelle_pulita_percent":71}"""
+
+
+BEAUTY_PROMPT_DERMOSCOPE = """Sei beauty advisor PRO con dermoscopio. Analizza questa foto DERMOSCOPICA (polarizzata, sub-cutanea).
+
+Questa foto è stata pre-processata con simulazione dermoscopica:
+- Cross-polarizzazione: riflessi rimossi, sub-surface visibile
+- Unsharp mask: micro-rughe e micro-pori amplificati
+- Hue boost: vasi sanguigni e pigmentazione sub-cutanea evidenziati
+
+VEDI COSE INVISIBILI IN SELFIE NORMALI:
+- Micro-rughe invisibili a occhio nudo
+- Pori reali (non mascherati da makeup/luce)
+- Texture sub-skin (disidratazione vera del derma)
+- Vasi/occhiaie profonde (non ombre superficiali)
+
+BEAUTY SCALE 0-100 (100=perfetta, 0=problematico):
+- Rughe: 100=no micro-lines nemmeno in dermoscopia, 70=micro-rughe normali per età, 40=rughe visibili anche senza dermoscopio, 0=deep dermal damage
+- Pori: 100=invisible anche in dermoscopia, 70=micro-pori normali, 40=pori dilatati visibili, 0=large oil control needed
+- Macchie: 100=uniform canvas sub-cutaneo, 70=lieve pigmentazione sub-skin, 40=macchie moderate, 0=heavy pigmentation
+- Occhiaie: 100=no vascular sub-cutaneo, 70=lieve rete vascolare normale, 40=vasi evidenti corrector needed, 0=deep blue vascular
+- Disidratazione: 100=plump dermal water ottimale, 70=buona idratazione dermica, 40=derma opaco, 0=dry cracked matrix
+- Acne: 100=flawless sub-cutaneo, 70=micro-comedoni sub-skin, 40=infiammazione sub-cutanea, 0=active inflammatory deep
+- pelle_pulita_percent: % ready natural makeup (media dei 6 scores)
+
+IMPORTANTE - DERMOSCOPIA vs SELFIE:
+- In dermoscopia TUTTO è più visibile. Scores tendono ad essere 5-15 punti più bassi del selfie normale.
+- Una donna 40 con pelle "perfetta" in selfie avrà rughe=70-75 in dermoscopia (micro-rughe normali).
+- NON dare scores troppo bassi: micro-rughe e micro-pori sono NORMALI in dermoscopia.
+
+ESEMPI DERMOSCOPIA:
+
+Es1 [donna 40, pelle curata, dermoscopia]:
+{"rughe":72,"pori":78,"macchie":80,"occhiaie":68,"disidratazione":65,"acne":95,"pelle_pulita_percent":76}
+
+Es2 [donna 70, dermoscopia]:
+{"rughe":20,"pori":82,"macchie":48,"occhiaie":45,"disidratazione":30,"acne":92,"pelle_pulita_percent":53}
+
+Es3 [ragazza 20, acne, dermoscopia]:
+{"rughe":92,"pori":30,"macchie":50,"occhiaie":75,"disidratazione":65,"acne":25,"pelle_pulita_percent":56}
+
+Valutazione dermoscopica breve, poi JSON esatto:
+{"rughe":<0-100>,"pori":<0-100>,"macchie":<0-100>,"occhiaie":<0-100>,"disidratazione":<0-100>,"acne":<0-100>,"pelle_pulita_percent":<0-100>}
+
+Rispondi SOLO con la valutazione breve seguita dal JSON. Nessun altro testo."""
+
+
+# ============================================================
+# HELPER: Chiama Groq e parsa risposta
+# ============================================================
+
+def call_groq_vision(img_base64: str, prompt: str, contesto_utente: str = "") -> dict:
+    """Chiama Groq Maverick Vision e restituisce scores + ragionamento."""
+    full_prompt = prompt
+    if contesto_utente:
+        full_prompt += f"\n\n{contesto_utente}"
+    full_prompt += "\n\nORA ANALIZZA QUESTA FOTO."
+
+    client = get_groq_client()
+
+    response = client.chat.completions.create(
+        model="meta-llama/llama-4-maverick-17b-128e-instruct",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": full_prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}}
+                ]
+            }
+        ],
+        temperature=0.15,
+        max_tokens=800
+    )
+
+    result_text = response.choices[0].message.content.strip()
+
+    # Estrai JSON
+    json_match = re.search(r'\{[^{}]*"rughe"[^{}]*\}', result_text)
+    if not json_match:
+        json_match = re.search(r'\{[^{}]+\}', result_text)
+    if not json_match:
+        raise ValueError(f"Nessun JSON trovato nella risposta: {result_text[:200]}")
+
+    analysis_data = json.loads(json_match.group())
+
+    # Validazione
+    required_fields = ["rughe", "pori", "macchie", "occhiaie", "disidratazione", "acne"]
+    for field in required_fields:
+        if field not in analysis_data:
+            analysis_data[field] = 50
+        val = analysis_data[field]
+        if isinstance(val, (int, float)):
+            analysis_data[field] = max(0, min(100, int(round(val))))
+        else:
+            analysis_data[field] = 50
+
+    # Ricalcola pelle_pulita_percent
+    media = sum(analysis_data[f] for f in required_fields) / len(required_fields)
+    analysis_data["pelle_pulita_percent"] = max(0, min(100, int(round(media))))
+
+    # Ragionamento
+    ragionamento = result_text[:result_text.find('{')].strip() if '{' in result_text else ""
+
+    return {"scores": analysis_data, "ragionamento": ragionamento}
+
+
+def build_contesto_utente(quiz_data: dict) -> str:
+    """Costruisce il contesto utente dal questionario."""
+    if not quiz_data:
+        return ""
+    return f"""
 INFORMAZIONI DALL'UTENTE (questionario compilato):
 - Età dichiarata: {quiz_data.get('age', 'non specificata')}
 - Genere: {quiz_data.get('gender', 'non specificato')}
@@ -325,153 +455,166 @@ INFORMAZIONI DALL'UTENTE (questionario compilato):
 - Allergie: {quiz_data.get('allergies', 'nessuna')}
 - Obiettivo top: {quiz_data.get('obiettivo_top', 'non specificato')}
 
-USA QUESTE INFORMAZIONI per calibrare la tua analisi. Ad esempio:
-- Se l'utente dichiara pelle secca, dai più peso alla disidratazione.
-- Se l'utente dorme poco (<6h), le occhiaie potrebbero essere più marcate.
-- L'età dichiarata aiuta a contestualizzare le rughe (normali per l'età vs premature).
-"""
+USA QUESTE INFORMAZIONI per calibrare la tua analisi beauty."""
 
-        # Prompt con few-shot + CoT + scale dermatologiche
-        prompt = f"""Sei un dermatologo con 20 anni di esperienza clinica. Analizza questa foto del viso in close-up.
 
-RAGIONA PASSO-PASSO:
-1. Identifica età approssimativa, etnia probabile e condizioni di illuminazione della foto.
-2. Valuta ogni feature usando le scale dermatologiche standard sotto.
-3. Assegna uno score da 0 a 100 per ogni parametro.
-4. Restituisci SOLO il JSON finale.
+def build_extras(scores: dict, quiz_data: dict) -> dict:
+    """Costruisce armocromia, prodotti, routine, makeup recs."""
+    extras = {}
 
-SCALE DERMATOLOGICHE DI RIFERIMENTO:
-- Rughe: scala Glogau (0=nessuna linea visibile Glogau I, 25=linee minime a riposo Glogau II, 50=rughe visibili a riposo Glogau III, 75-100=rughe profonde diffuse Glogau IV)
-- Pori: 0=invisibili ad occhio nudo, 30=leggermente visibili zona T, 60=visibili e dilatati, 100=molto dilatati e oleosi
-- Macchie: scala MASI-like (0=tono uniforme, 25=lieve discromia, 50=macchie moderate, 75-100=iperpigmentazione estesa)
-- Occhiaie: 0=nessuna ombra periorbitale, 25=lieve ombra, 50=occhiaie moderate vascolari, 75-100=occhiaie profonde scure
-- Disidratazione: 0=pelle turgida e luminosa, 25=lieve secchezza, 50=pelle opaca e poco elastica, 75-100=pelle secca desquamata
-- Acne: scala Leeds (0=nessuna lesione, 25=pochi comedoni, 50=papule e pustole moderate, 75-100=acne nodulare severa)
-- Pelle pulita %: calcolata come 100 - (media di rughe+pori+macchie+occhiaie+disidratazione+acne)/6
+    # Calibrazione
+    calibrated = calibrate_beauty_scores(scores, quiz_data)
+    extras["calibrated_scores"] = calibrated
 
-{contesto_utente}
+    # Armocromia
+    extras["armocromia"] = calcola_armocromia(quiz_data)
 
-ESEMPI DI RIFERIMENTO (few-shot):
+    # Makeup recommendations
+    makeup_recs = []
+    if calibrated["pori"] < 60:
+        makeup_recs.append("Primer pori (silicone-based)")
+    if calibrated["occhiaie"] < 60:
+        makeup_recs.append("Corrector occhiaie (pesca/arancio)")
+    if calibrated["macchie"] < 60:
+        makeup_recs.append("Concealer alta copertura")
+    if calibrated["disidratazione"] < 60:
+        makeup_recs.append("Dewy foundation + setting spray idratante")
+    elif calibrated["disidratazione"] >= 70:
+        makeup_recs.append("Foundation naturale o tinted moisturizer")
+    if calibrated["acne"] < 60:
+        makeup_recs.append("Green primer + fondotinta oil-free")
+    if calibrated["rughe"] < 60:
+        makeup_recs.append("Primer anti-age + foundation idratante (no matte)")
+    if not makeup_recs:
+        makeup_recs.append("Minimal makeup: BB cream + mascara")
+    extras["makeup_recommendations"] = makeup_recs
 
-Esempio 1 - Donna 25 anni, asiatica, buona illuminazione, pelle liscia:
-Ragionamento: Pelle giovane con texture fine. Linee minime naso-labiali appena percettibili. Pori quasi invisibili. Tono uniforme. Lieve disidratazione zona guance. Nessuna lesione acneica.
-{{"rughe":15,"pori":20,"macchie":5,"occhiaie":10,"disidratazione":20,"acne":0,"pelle_pulita_percent":88}}
+    # Skincare routine recs
+    skincare_recs = []
+    if calibrated["disidratazione"] < 70:
+        skincare_recs.append("Siero acido ialuronico (mattina)")
+    if calibrated["macchie"] < 70:
+        skincare_recs.append("Siero vitamina C (mattina)")
+    if calibrated["rughe"] < 60:
+        skincare_recs.append("Retinolo 0.3% (sera, 2-3x/settimana)")
+    if calibrated["acne"] < 70:
+        skincare_recs.append("Niacinamide 10% (sera)")
+    if calibrated["pori"] < 60:
+        skincare_recs.append("BHA/Acido salicilico (sera, 2x/settimana)")
+    skincare_recs.append("SPF 50+ (sempre, ogni mattina)")
+    extras["skincare_routine"] = skincare_recs
 
-Esempio 2 - Uomo 45 anni, caucasico, luce naturale, rughe fronte moderate:
-Ragionamento: Rughe di espressione fronte e zampe di gallina moderate. Pori visibili zona T. Qualche macchia solare guance. Occhiaie moderate. Pelle leggermente disidratata. Nessuna acne attiva.
-{{"rughe":50,"pori":35,"macchie":20,"occhiaie":35,"disidratazione":40,"acne":0,"pelle_pulita_percent":55}}
+    # Link prodotti Amazon
+    tipo_pelle = quiz_data.get("skin_type", "Mista")
+    problema = quiz_data.get("problema_principale", "")
+    obiettivo = quiz_data.get("obiettivo_top", "")
+    if not problema:
+        score_map = {
+            "Rughe": calibrated["rughe"],
+            "Pori/Macchie": min(calibrated["pori"], calibrated["macchie"]),
+            "Occhiaie": calibrated["occhiaie"],
+            "Disidratazione": calibrated["disidratazione"],
+            "Acne": calibrated["acne"]
+        }
+        problema = min(score_map, key=score_map.get)
+    extras["prodotti_consigliati"] = genera_link_amazon(problema, tipo_pelle, obiettivo)
 
-Esempio 3 - Donna 65 anni, pelle chiara, macchie solari evidenti:
-Ragionamento: Rughe profonde fronte e solchi naso-labiali. Pori poco visibili. Discromie e macchie solari diffuse. Occhiaie moderate. Pelle opaca e poco elastica. Nessuna acne.
-{{"rughe":75,"pori":20,"macchie":55,"occhiaie":45,"disidratazione":65,"acne":0,"pelle_pulita_percent":27}}
+    # Routine completa
+    extras["routine"] = genera_routine(calibrated, quiz_data)
 
-Esempio 4 - Ragazzo 19 anni, acne attiva, pori dilatati:
-Ragionamento: Pelle giovane ma con acne attiva. Comedoni e pustole su guance e fronte. Pori molto dilatati zona T. Qualche segno post-acneico. Pelle grassa non disidratata. Occhiaie minime.
-{{"rughe":5,"pori":65,"macchie":35,"occhiaie":15,"disidratazione":15,"acne":60,"pelle_pulita_percent":35}}
+    return extras
 
-ORA ANALIZZA QUESTA FOTO.
-Ragionamento breve, poi JSON esatto con questa struttura:
-{{"rughe":<0-100>,"pori":<0-100>,"macchie":<0-100>,"occhiaie":<0-100>,"disidratazione":<0-100>,"acne":<0-100>,"pelle_pulita_percent":<0-100>}}
 
-Rispondi SOLO con il ragionamento breve seguito dal JSON. Nessun altro testo."""
+# ============================================================
+# ENDPOINTS
+# ============================================================
 
-        # Chiama Groq Vision API
-        client = get_groq_client()
+@app.get("/health")
+async def health():
+    return {"status": "ok", "engine": "Groq Maverick + Dermoscopio Virtuale", "version": "3.0"}
 
-        response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": prompt
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{img_base64}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            temperature=0.2,
-            max_tokens=800
-        )
 
-        # Estrai la risposta
-        result_text = response.choices[0].message.content.strip()
+@app.post("/analyze")
+async def analyze(
+    file: UploadFile = File(...),
+    questionnaire: str = Form(default="{}")
+):
+    """
+    Analisi Beauty Standard: foto normale + Maverick beauty advisor.
+    Scala INVERTITA: 100=perfetto, 0=problematico.
+    """
+    try:
+        try:
+            quiz_data = json.loads(questionnaire)
+        except json.JSONDecodeError:
+            quiz_data = {}
 
-        # Estrai il JSON dalla risposta (può essere dopo il ragionamento CoT)
-        json_match = re.search(r'\{[^{}]*"rughe"[^{}]*\}', result_text)
-        if json_match:
-            json_str = json_match.group()
-        else:
-            # Prova a trovare qualsiasi JSON valido
-            json_match = re.search(r'\{[^{}]+\}', result_text)
-            if json_match:
-                json_str = json_match.group()
-            else:
-                return {"status": "error", "message": "Nessun JSON trovato nella risposta", "raw": result_text}
+        img_bytes = await file.read()
+        img_base64 = base64.b64encode(img_bytes).decode("utf-8")
 
-        # Parse JSON
-        analysis_data = json.loads(json_str)
+        contesto = build_contesto_utente(quiz_data)
+        groq_result = call_groq_vision(img_base64, BEAUTY_PROMPT_STANDARD, contesto)
 
-        # Validazione e normalizzazione valori (0-100 interi)
-        required_fields = ["rughe", "pori", "macchie", "occhiaie", "disidratazione", "acne"]
-        for field in required_fields:
-            if field not in analysis_data:
-                analysis_data[field] = 0
-            val = analysis_data[field]
-            if isinstance(val, (int, float)):
-                analysis_data[field] = max(0, min(100, int(round(val))))
-            else:
-                analysis_data[field] = 0
-
-        # Ricalcola pelle_pulita_percent con formula
-        media_problemi = sum(analysis_data[f] for f in required_fields) / len(required_fields)
-        analysis_data["pelle_pulita_percent"] = max(0, min(100, int(round(100 - media_problemi))))
-
-        # Estrai ragionamento CoT (tutto prima del JSON)
-        ragionamento = result_text[:result_text.find('{')].strip() if '{' in result_text else ""
-
-        # Costruisci risposta completa
         result = {
             "status": "success",
-            "scores": analysis_data,
-            "ragionamento": ragionamento
+            "mode": "standard",
+            "beauty_scores": groq_result["scores"],
+            "ragionamento": groq_result["ragionamento"]
         }
 
-        # Se c'è il questionario, aggiungi armocromia, prodotti e routine
         if quiz_data and len(quiz_data) > 2:
-            # Armocromia
-            armocromia = calcola_armocromia(quiz_data)
-            result["armocromia"] = armocromia
+            extras = build_extras(groq_result["scores"], quiz_data)
+            result.update(extras)
+        else:
+            result["calibrated_scores"] = groq_result["scores"]
 
-            # Link prodotti Amazon
-            tipo_pelle = quiz_data.get("skin_type", "Mista")
-            problema = quiz_data.get("problema_principale", "")
-            obiettivo = quiz_data.get("obiettivo_top", "")
+        return result
 
-            # Se non c'è problema dichiarato, usa il punteggio più alto
-            if not problema:
-                score_map = {
-                    "Rughe": analysis_data["rughe"],
-                    "Pori/Macchie": max(analysis_data["pori"], analysis_data["macchie"]),
-                    "Occhiaie": analysis_data["occhiaie"],
-                    "Disidratazione": analysis_data["disidratazione"],
-                    "Acne": analysis_data["acne"]
-                }
-                problema = max(score_map, key=score_map.get)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-            prodotti = genera_link_amazon(problema, tipo_pelle, obiettivo)
-            result["prodotti_consigliati"] = prodotti
 
-            # Routine personalizzata
-            routine = genera_routine(analysis_data, quiz_data)
-            result["routine"] = routine
+@app.post("/analyze-dermoscope")
+async def analyze_dermoscope(
+    file: UploadFile = File(...),
+    questionnaire: str = Form(default="{}")
+):
+    """
+    Analisi Dermoscopio PRO: pre-processing OpenCV + Maverick beauty advisor.
+    Rivela micro-rughe, pori reali, texture sub-cutanea.
+    Scala INVERTITA: 100=perfetto, 0=problematico.
+    """
+    try:
+        try:
+            quiz_data = json.loads(questionnaire)
+        except json.JSONDecodeError:
+            quiz_data = {}
+
+        # 1. Leggi immagine originale
+        img_bytes = await file.read()
+
+        # 2. Applica dermoscopio virtuale
+        derm_bytes, derm_b64 = dermoscope_effect(img_bytes)
+
+        # 3. Analizza immagine dermoscopica con Maverick
+        derm_base64 = base64.b64encode(derm_bytes).decode("utf-8")
+        contesto = build_contesto_utente(quiz_data)
+        groq_result = call_groq_vision(derm_base64, BEAUTY_PROMPT_DERMOSCOPE, contesto)
+
+        result = {
+            "status": "success",
+            "mode": "dermoscope",
+            "beauty_scores": groq_result["scores"],
+            "ragionamento": groq_result["ragionamento"],
+            "derm_image_b64": derm_b64,
+            "processing": "dermoscope_virtual_applied"
+        }
+
+        if quiz_data and len(quiz_data) > 2:
+            extras = build_extras(groq_result["scores"], quiz_data)
+            result.update(extras)
+        else:
+            result["calibrated_scores"] = groq_result["scores"]
 
         return result
 
