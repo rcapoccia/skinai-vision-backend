@@ -10,7 +10,7 @@ from groq import Groq
 
 app = FastAPI(title="SkinGlow AI - Super Backend")
 
-# Configurazione CORS
+# Configurazione CORS per comunicare con il frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,21 +26,21 @@ if os.environ.get("GROQ_API_KEY"):
 
 session = None
 model_path = "skin_analyzer.onnx"
-debug_error = "Nessun errore"
+errore_caricamento = "Nessun errore"
 
-# Tentativo di caricamento modello
+# Caricamento del modello ONNX all'avvio
 try:
     if os.path.exists(model_path):
-        # Carichiamo il modello ONNX
+        # Inizializza la sessione ONNX
         session = ort.InferenceSession(model_path)
-        print("✅ Modello caricato con successo!")
+        print("✅ Modello ONNX caricato con successo!")
     else:
-        debug_error = f"File {model_path} non trovato nel server"
+        errore_caricamento = f"File {model_path} non trovato nel server."
 except Exception as e:
-    debug_error = f"Errore ONNX: {str(e)}"
-    print(f"❌ Errore caricamento: {e}")
+    errore_caricamento = f"Errore tecnico ONNX: {str(e)}"
+    print(f"❌ Errore critico nel caricamento del modello: {e}")
 
-# --- ENDPOINT DI CONTROLLO ---
+# --- ENDPOINT DI DIAGNOSTICA ---
 @app.get("/health")
 async def health():
     return {
@@ -48,7 +48,7 @@ async def health():
         "model_loaded": session is not None,
         "onnx_file_present": os.path.exists(model_path),
         "groq_key_configured": os.environ.get("GROQ_API_KEY") is not None,
-        "errore_tecnico": debug_error
+        "errore_dettagliato": errore_caricamento
     }
 
 # --- ENDPOINT DI ANALISI ---
@@ -56,23 +56,23 @@ async def health():
 async def analyze(file: UploadFile = File(...), questionnaire: str = Form("{}")):
     try:
         if session is None:
-            return {"status": "error", "message": f"IA non pronta: {debug_error}"}
+            return {"status": "error", "message": f"Il motore AI non è pronto: {errore_caricamento}"}
 
         # 1. Lettura Immagine
         img_data = await file.read()
         img = Image.open(io.BytesIO(img_data)).convert("RGB").resize((224, 224))
         
-        # 2. Pre-processing (Modello ONNX vuole float32 e formato CHW)
+        # 2. Pre-processing per ONNX (Scala 0-1, formato CHW)
         arr = np.array(img, dtype=np.float32) / 255.0
-        arr = np.transpose(arr, (2, 0, 1))
-        arr = np.expand_dims(arr, 0)
+        arr = np.transpose(arr, (2, 0, 1)) # Da HWC a CHW
+        arr = np.expand_dims(arr, 0)       # Aggiungi batch dimension
         
-        # 3. Inferenza
+        # 3. Esecuzione Modello
         input_name = session.get_inputs()[0].name
         output = session.run(None, {input_name: arr})
-        res = output[0][0] 
+        res = output[0][0] # Prendi i risultati del primo batch
 
-        # 4. Fix Scala 0-100 (Sincronizzato con Frontend)
+        # 4. Calibrazione Scala 0-100 (Sincronizzato con il tuo Dashboard)
         def fix(v): return float(round(min(100, max(0, v * 100))))
 
         calibrated = {
@@ -85,19 +85,19 @@ async def analyze(file: UploadFile = File(...), questionnaire: str = Form("{}"))
             "pelle_pulita_percent": fix(1.0 - (res[5] * 0.5))
         }
 
-        # 5. Ragionamento AI con Groq
-        ragionamento = "Analisi biometrica completata."
+        # 5. Generazione Ragionamento con Groq
+        ragionamento = "Analisi biometrica completata con successo."
         if GROQ_CLIENT:
             try:
                 quiz_data = json.loads(questionnaire)
-                prompt = f"Analisi pelle: {calibrated}. Contesto: {quiz_data}. Commenta in 2 frasi in italiano."
+                prompt = f"Analisi pelle: {calibrated}. Contesto Utente: {quiz_data}. Spiega il risultato in 2 frasi semplici e professionali in italiano."
                 chat = GROQ_CLIENT.chat.completions.create(
                     messages=[{"role": "user", "content": prompt}],
                     model="llama-3.1-8b-instant",
                 )
                 ragionamento = chat.choices[0].message.content
             except:
-                pass
+                pass # Fallback al messaggio standard se Groq fallisce
 
         return {
             "status": "success",
@@ -110,4 +110,6 @@ async def analyze(file: UploadFile = File(...), questionnaire: str = Form("{}"))
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    # Usa la porta fornita da Railway o la 8080 come default
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
