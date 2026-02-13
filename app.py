@@ -8,7 +8,7 @@ import onnxruntime as ort
 import json
 from groq import Groq
 
-app = FastAPI(title="SkinGlow AI - Super Backend Cami")
+app = FastAPI(title="SkinGlow AI - Super Backend")
 
 # Configurazione CORS
 app.add_middleware(
@@ -19,70 +19,82 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inizializza Groq e ONNX
-GROQ_CLIENT = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# 1. Configurazione Groq
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_CLIENT = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+# 2. Caricamento Modello ONNX
 session = None
+model_path = "skin_analyzer.onnx"
 
 try:
-    model_path = "skin_analyzer.onnx"
-    session = ort.InferenceSession(model_path)
-    print(f"✅ Motore ONNX pronto")
+    if os.path.exists(model_path):
+        session = ort.InferenceSession(model_path)
+        print("✅ MODELLO CARICATO: skin_analyzer.onnx trovato e attivo.")
+    else:
+        print(f"❌ ERRORE: Il file {model_path} non esiste nella cartella principale.")
 except Exception as e:
-    print(f"❌ Errore caricamento modello: {e}")
+    print(f"❌ ERRORE CRITICO: Impossibile avviare il motore ONNX: {e}")
+
+# --- QUESTA È LA PARTE CHE MANCAVA ---
+@app.get("/health")
+async def health():
+    return {
+        "status": "online",
+        "model_loaded": session is not None,
+        "onnx_file_present": os.path.exists(model_path),
+        "groq_key_configured": GROQ_API_KEY is not None
+    }
+# -------------------------------------
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...), questionnaire: str = Form("{}")):
     try:
-        # 1. Lettura e Pre-processing Immagine
+        if session is None:
+            return {"status": "error", "message": "Modello AI non caricato sul server."}
+
+        # Lettura immagine
         img_data = await file.read()
-        img = Image.open(io.BytesIO(img_data)).convert("RGB")
-        img_resized = img.resize((224, 224))
+        img = Image.open(io.BytesIO(img_data)).convert("RGB").resize((224, 224))
         
-        # Preparazione per ONNX (Scala 0-1, formato NCHW)
-        arr = np.array(img_resized, dtype=np.float32) / 255.0
+        # Pre-processing
+        arr = np.array(img, dtype=np.float32) / 255.0
         arr = np.transpose(arr, (2, 0, 1))
         arr = np.expand_dims(arr, 0)
         
-        # 2. Inferenza Matematica (Numeri Puri)
+        # Inferenza
         input_name = session.get_inputs()[0].name
         output = session.run(None, {input_name: arr})
-        predictions = output[0][0] # Otteniamo i 6 parametri base
-        
-        # 3. Calibrazione e Scala 0-100
-        # Trasformiamo i valori grezzi (spesso 0-1 o piccoli) in scala 0-100
-        def to_100(val): return min(100, max(0, float(val) * 100))
+        res = output[0][0] 
+
+        # Fix scala 0-100
+        def fix(v): return float(round(min(100, max(0, v * 100))))
 
         calibrated = {
-            "rughe": to_100(predictions[0] * 0.8), # Correzione sensibilità
-            "pori": to_100(predictions[1]),
-            "macchie": to_100(predictions[2] * 0.9),
-            "occhiaie": to_100(predictions[3]),
-            "disidratazione": to_100(predictions[4]),
-            "acne": to_100(predictions[5] * 0.7), # Riduzione falsi positivi acne
-            "pelle_pulita_percent": to_100(1.0 - (predictions[5] * 0.5)) # Calcolo inverso
+            "rughe": fix(res[0]),
+            "pori": fix(res[1]),
+            "macchie": fix(res[2]),
+            "occhiaie": fix(res[3]),
+            "disidratazione": fix(res[4]),
+            "acne": fix(res[5]),
+            "pelle_pulita_percent": fix(1.0 - (res[5] * 0.5))
         }
 
-        # 4. Generazione Ragionamento con Groq (Basato sui numeri reali)
-        quiz_data = json.loads(questionnaire)
-        prompt = f"""
-        Analizza questi dati biometrici della pelle: {calibrated}.
-        Contesto utente: {quiz_data}.
-        Scrivi un breve ragionamento professionale (max 3 frasi) spiegando il risultato principale.
-        Sii incoraggiante e preciso.
-        """
-        
-        chat_completion = GROQ_CLIENT.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant",
-        )
-        ragionamento = chat_completion.choices[0].message.content
+        # Ragionamento Groq
+        ragionamento = "Analisi biometrica completata."
+        if GROQ_CLIENT:
+            prompt = f"Analisi pelle: {calibrated}. Quiz: {questionnaire}. Spiega il risultato in 2 frasi in italiano."
+            chat = GROQ_CLIENT.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.1-8b-instant",
+            )
+            ragionamento = chat.choices[0].message.content
 
         return {
             "status": "success",
             "calibrated_scores": calibrated,
             "ragionamento": ragionamento
         }
-
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
