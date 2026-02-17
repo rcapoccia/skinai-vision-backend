@@ -1,7 +1,6 @@
-fastapi
-uvicorn
-pillow
-numpy<2.0
+flask
+flask-cors
+numpy
+opencv-python-headless
 onnxruntime
 groq
-python-multipart
