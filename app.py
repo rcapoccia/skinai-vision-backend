@@ -1,78 +1,64 @@
 import os
+import base64
+import json
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import cv2
-import onnxruntime as ort
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 from groq import Groq
 
-app = Flask(__name__)
-CORS(app)
+app = FastAPI(title="SkinGlow AI - Maverick-Groq")
 
-# Configurazione Groq
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-MODEL_PATH = "skin_analyzer.onnx"
-session = None
-model_loaded = False
-error_msg = ""
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Inizializzazione Sessione ONNX
-try:
-    if os.path.exists(MODEL_PATH):
-        # NOTA: ONNX cercherà automaticamente skin_analyzer.onnx.data
-        session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
-        model_loaded = True
-        print("✅ Modello caricato correttamente")
-    else:
-        error_msg = "File .onnx non trovato"
-except Exception as e:
-    error_msg = str(e)
-    print(f"❌ Errore caricamento: {e}")
+def dermoscope_effect(image_bytes):
+    """Processa l'immagine con OpenCV (Dermoscopio) per Groq."""
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    # Effetto dermoscopio (Unsharp Mask + Contrast)
+    gaussian = cv2.GaussianBlur(img, (0, 0), 3)
+    img = cv2.addWeighted(img, 1.5, gaussian, -0.5, 0)
+    _, buffer = cv2.imencode('.jpg', img)
+    return base64.b64encode(buffer).decode('utf-8')
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({
-        "status": "online",
-        "model_loaded": model_loaded,
-        "error": error_msg,
-        "onnx_file_present": os.path.exists(MODEL_PATH)
-    })
+@app.get("/health")
+async def health():
+    return {"status": "online", "mode": "Maverick-Groq", "key_set": bool(os.environ.get("GROQ_API_KEY"))}
 
-@app.route('/analyze', methods=['POST'])
-def analyze():
-    if not model_loaded:
-        return jsonify({"error": f"Modello non pronto: {error_msg}"}), 500
-    
-    if 'image' not in request.files:
-        return jsonify({"error": "Immagine mancante"}), 400
-    
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)):
     try:
-        file = request.files['image']
-        # Pre-processing base
-        nparr = np.frombuffer(file.read(), np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        img = cv2.resize(img, (224, 224)).astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))
-        img = np.expand_dims(img, axis=0)
-
-        # Inferenza
-        input_name = session.get_inputs()[0].name
-        raw_scores = session.run(None, {input_name: img})[0][0]
-
-        results = {
-            "rughe": round(float(raw_scores[0]) * 100, 1),
-            "pori": round(float(raw_scores[1]) * 100, 1),
-            "pigmentazione": round(float(raw_scores[2]) * 100, 1),
-            "idratazione": round(float(raw_scores[3]) * 100, 1),
-            "sensibilita": round(float(raw_scores[4]) * 100, 1)
-        }
-
-        return jsonify({"analysis": results})
+        img_bytes = await file.read()
+        # 1. Pre-processing Maverick
+        img_b64 = dermoscope_effect(img_bytes)
+        
+        # 2. Chiamata a Groq Vision
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Analizza questa immagine dermoscopica. Restituisci JSON con punteggi 0-100 per: rughe, pori, macchie, occhiaie, acne."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                    ],
+                }
+            ],
+            model="llama-3.2-11b-vision-preview",
+            response_format={"type": "json_object"}
+        )
+        
+        return json.loads(chat_completion.choices[0].message.content)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return {"error": str(e)}
 
-if __name__ == '__main__':
-    # Fondamentale per Railway: legge la porta assegnata
-    port = int(os.environ.get("PORT", 3001))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
