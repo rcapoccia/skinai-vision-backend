@@ -1,7 +1,6 @@
 fastapi
 uvicorn[standard]
 groq
-opencv-python-headless
 numpy
 python-multipart
 pillow
