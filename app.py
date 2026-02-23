@@ -2,6 +2,7 @@ import os
 import base64
 import json
 import io
+import hashlib
 from PIL import Image, ImageFilter
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +19,7 @@ app.add_middleware(
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
+
 def dermoscope_effect(image_bytes):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     sharpened = img.filter(ImageFilter.SHARPEN)
@@ -25,9 +27,16 @@ def dermoscope_effect(image_bytes):
     sharpened.save(buffer, format="JPEG")
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
+
+def image_seed(image_bytes):
+    """Seed deterministico dall'hash MD5 dell'immagine."""
+    return int(hashlib.md5(image_bytes).hexdigest()[:8], 16)
+
+
 @app.get("/health")
 async def health():
     return {"status": "online", "mode": "Maverick-Groq", "api_key": bool(os.environ.get("GROQ_API_KEY"))}
+
 
 @app.post("/analyze")
 @app.post("/analyze-dermoscope")
@@ -35,6 +44,7 @@ async def analyze(file: UploadFile = File(...)):
     try:
         img_bytes = await file.read()
         img_b64 = dermoscope_effect(img_bytes)
+        seed = image_seed(img_bytes)
 
         completion = client.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
@@ -58,28 +68,33 @@ Restituisci ESCLUSIVAMENTE un oggetto JSON con questa struttura, senza testo agg
     },
     "ragionamento": "<analisi breve in italiano>"
 }
-Scala: 100 = pelle perfetta, 0 = problema grave."""
+Scala: 100 = pelle perfetta, 0 = problema grave.
+Assegna punteggi basati SOLO su ciò che vedi. La stessa immagine deve sempre produrre gli stessi punteggi."""
                         },
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
                     ],
                 }
             ],
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            temperature=0,
+            seed=seed,
         )
 
         analysis_result = json.loads(completion.choices[0].message.content)
-
         required_fields = ["rughe", "pori", "macchie", "occhiaie", "disidratazione", "acne", "pelle_pulita_percent"]
         if "beauty_scores" not in analysis_result:
             analysis_result["beauty_scores"] = {}
         for field in required_fields:
             if field not in analysis_result["beauty_scores"]:
                 analysis_result["beauty_scores"][field] = 50
-
+        for field in required_fields:
+            val = analysis_result["beauty_scores"][field]
+            analysis_result["beauty_scores"][field] = max(0, min(100, int(val)))
         return analysis_result
 
     except Exception as e:
         return {"error": str(e), "status": "failed"}
+
 
 if __name__ == "__main__":
     import uvicorn
