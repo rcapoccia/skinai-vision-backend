@@ -19,23 +19,16 @@ app.add_middleware(
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Dimensione massima lato lungo per evitare timeout SSL su immagini grandi
 MAX_IMAGE_SIZE = 1024
 
 
 def prepare_image(image_bytes):
-    """Ridimensiona se necessario, applica sharpening, restituisce (base64 JPEG, bytes processati)."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    # Resize se troppo grande (evita timeout SSL con PNG pesanti)
     w, h = img.size
     if max(w, h) > MAX_IMAGE_SIZE:
         ratio = MAX_IMAGE_SIZE / max(w, h)
         img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
-
-    # Dermoscope effect
     img = img.filter(ImageFilter.SHARPEN)
-
     buffer = io.BytesIO()
     img.save(buffer, format="JPEG", quality=85)
     processed_bytes = buffer.getvalue()
@@ -43,7 +36,6 @@ def prepare_image(image_bytes):
 
 
 def image_seed(image_bytes):
-    """Seed deterministico dall'hash MD5 dell'immagine processata."""
     return int(hashlib.md5(image_bytes).hexdigest()[:8], 16)
 
 
@@ -132,10 +124,7 @@ async def analyze(file: UploadFile = File(...)):
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": PROMPT
-                        },
+                        {"type": "text", "text": PROMPT},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
                     ],
                 }
