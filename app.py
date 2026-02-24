@@ -24,7 +24,7 @@ MAX_IMAGE_SIZE = 1024
 
 
 def prepare_image(image_bytes):
-    """Ridimensiona se necessario, applica sharpening, restituisce base64 JPEG."""
+    """Ridimensiona se necessario, applica sharpening, restituisce (base64 JPEG, bytes processati)."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
     # Resize se troppo grande (evita timeout SSL con PNG pesanti)
@@ -38,11 +38,12 @@ def prepare_image(image_bytes):
 
     buffer = io.BytesIO()
     img.save(buffer, format="JPEG", quality=85)
-    return base64.b64encode(buffer.getvalue()).decode('utf-8')
+    processed_bytes = buffer.getvalue()
+    return base64.b64encode(processed_bytes).decode('utf-8'), processed_bytes
 
 
 def image_seed(image_bytes):
-    """Seed deterministico dall'hash MD5 dell'immagine originale."""
+    """Seed deterministico dall'hash MD5 dell'immagine processata."""
     return int(hashlib.md5(image_bytes).hexdigest()[:8], 16)
 
 
@@ -122,8 +123,8 @@ async def health():
 async def analyze(file: UploadFile = File(...)):
     try:
         img_bytes = await file.read()
-        img_b64 = prepare_image(img_bytes)
-        seed = image_seed(img_bytes)
+        img_b64, processed_bytes = prepare_image(img_bytes)
+        seed = image_seed(processed_bytes)
 
         completion = client.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
