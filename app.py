@@ -21,7 +21,6 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 MAX_IMAGE_SIZE = 1024
 
-
 def prepare_image(image_bytes):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
@@ -34,81 +33,155 @@ def prepare_image(image_bytes):
     processed_bytes = buffer.getvalue()
     return base64.b64encode(processed_bytes).decode('utf-8'), processed_bytes
 
-
 def image_seed(image_bytes):
     return int(hashlib.md5(image_bytes).hexdigest()[:8], 16)
 
+PROMPT_A = """Sei un assistente dermatologico che valuta SOLO la TEXTURE della pelle del viso
+(rughe, pori, acne) osservando una foto frontale ben illuminata.
 
-PROMPT = """Sei un dermatologo AI esperto. Analizza attentamente l'immagine del viso fornita.
-
-Restituisci ESCLUSIVAMENTE un oggetto JSON con questa struttura, senza testo aggiuntivo:
+Devi restituire ESCLUSIVAMENTE un JSON con 3 campi numerici (0-100):
 {
-    "beauty_scores": {
-        "rughe": <0-100>,
-        "pori": <0-100>,
-        "macchie": <0-100>,
-        "occhiaie": <0-100>,
-        "disidratazione": <0-100>,
-        "acne": <0-100>,
-        "pelle_pulita_percent": <0-100>
-    },
-    "ragionamento": "<analisi dettagliata in italiano, 2-3 frasi>"
+  "rughe": ...,
+  "pori": ...,
+  "acne": ...
 }
 
-SCALA (100 = perfetto, 0 = problema grave):
+Linee guida IMPORTANTI:
+- Valuta ogni parametro INDIPENDENTEMENTE, come se 3 specialisti diversi non si parlassero.
+- NON considerare colore, macchie pigmentarie, occhiaie o luminosità globale.
+- Immagina di avere solo una mappa in scala di grigi della texture del viso.
 
-RUGHE (visibilità delle rughe):
-- 90-100: nessuna ruga visibile, pelle liscia
-- 70-89: qualche linea di espressione fine, rughe minime
-- 50-69: rughe moderate visibili sulla fronte o intorno agli occhi
-- 30-49: rughe profonde e numerose
-- 0-29: solchi profondi ovunque, pelle molto segnata
+Significato della scala (0-100, dove 100 = situazione migliore possibile):
+- Rughe:
+  90-100 = pelle liscia, nessuna ruga visibile nemmeno in espressione
+  75-89  = leggere linee di espressione, rughe minime
+  60-74  = rughe visibili nelle aree tipiche (fronte, contorno occhi, naso-labbiale)
+  40-59  = rughe marcate, più aree coinvolte
+  0-39   = rughe profonde e diffuse
 
-PORI (dimensione e visibilità dei pori):
-- 90-100: pori invisibili
-- 70-89: pori poco visibili
-- 50-69: pori moderatamente visibili
-- 0-49: pori molto dilatati e visibili
+- Pori:
+  90-100 = pori quasi invisibili anche da vicino
+  75-89  = pori piccoli, visibili solo da vicino
+  60-74  = pori moderatamente visibili su naso e guance
+  40-59  = pori dilatati evidenti su più zone
+  0-39   = pori molto dilatati, texture irregolare
 
-MACCHIE (uniformità del tono):
-- 90-100: tono uniforme, nessuna macchia
-- 70-89: minime discromie
-- 50-69: alcune macchie o discromie moderate
-- 0-49: macchie evidenti o iperpigmentazione diffusa
+- Acne (brufoli/lesioni attive):
+  90-100 = nessuna lesione attiva
+  75-89  = poche lesioni isolate
+  60-74  = acne lieve-moderata
+  40-59  = acne moderata-severa
+  0-39   = acne severa con molte lesioni
 
-OCCHIAIE (cerchi scuri/gonfiore sotto gli occhi):
-- 90-100: area sotto gli occhi luminosa, nessuna occhiaia
-- 70-89: occhiaie lievi, appena percettibili
-- 50-69: occhiaie moderate, visibili ma non marcate
-- 30-49: occhiaie marcate, colorazione scura evidente
-- 0-29: occhiaie molto scure o gonfiore pronunciato
-ATTENZIONE: anche una leggera colorazione bluastra/violacea sotto gli occhi = punteggio 60-75 (non 90+)
+Regole:
+- Usa SEMPRE numeri interi (es. 63, 87).
+- La stessa immagine deve produrre SEMPRE gli stessi punteggi.
+- Rispondi SOLO con il JSON, senza testo aggiuntivo."""
 
-DISIDRATAZIONE (livello di idratazione della pelle):
-- 90-100: pelle luminosa, idratata, elastica
-- 70-89: pelle ben idratata con piccole aree secche
-- 50-69: pelle moderatamente disidratata, opaca in alcune zone
-- 30-49: pelle chiaramente disidratata, opaca, poco elastica
-- 0-29: pelle molto secca, opaca, con fine texture di disidratazione
-ATTENZIONE: pelle opaca e poco elastica = punteggio 30-50, NON 60+
+PROMPT_B = """Sei un assistente dermatologico che valuta SOLO la PIGMENTAZIONE della pelle del viso:
+macchie (iperpigmentazione) e occhiaie (scurimento dell'area perioculare).
 
-ACNE (presenza di imperfezioni/brufoli):
-- 90-100: pelle pulita, nessuna imperfezione
-- 70-89: rarissime imperfezioni
-- 50-69: acne lieve
-- 0-49: acne moderata o grave
+Devi restituire ESCLUSIVAMENTE un JSON con 2 campi (0-100):
+{
+  "macchie": ...,
+  "occhiaie": ...
+}
 
-PELLE_PULITA_PERCENT (salute generale complessiva):
-- Media ponderata degli altri parametri
+IMPORTANTE:
+- Ignora completamente rughe, pori, acne, texture e luminosità globale.
+- Concentrati SOLO su colore e uniformità della pigmentazione.
 
-REGOLA FONDAMENTALE: la stessa immagine deve SEMPRE produrre gli stessi identici punteggi.
-Basa i punteggi SOLO su ciò che vedi nell'immagine, non su stime demografiche."""
+Scala (0-100, 100 = situazione migliore, cioè meno problema visibile):
 
+- Macchie (iperpigmentazione generale: macchie solari, discromie):
+  90-100 = tono molto uniforme, nessuna macchia visibile
+  75-89  = qualche piccola macchia isolata
+  60-74  = iperpigmentazione lieve-moderata in alcune aree
+  40-59  = macchie evidenti e diffuse
+  0-39   = iperpigmentazione marcata e molto diffusa
+
+- Occhiaie (area sotto gli occhi, colore e ombra):
+  90-100 = nessuna occhiaia visibile, area perioculare chiara
+  75-89  = leggero scurimento, occhiaie appena accennate
+  60-74  = occhiaie chiaramente visibili, ma non molto profonde
+  40-59  = occhiaie marcate, colore scuro o bluastro evidente
+  0-39   = occhiaie molto profonde e scure
+
+Ignora ombre da illuminazione:
+- Non confondere un'ombra di luce con un'occhiaia: se il bordo dell'ombra coincide con la direzione della luce, penalizza meno il punteggio.
+
+Regole:
+- Valuta macchie e occhiaie in modo INDIPENDENTE.
+- Usa solo interi.
+- Rispondi SOLO con il JSON, senza testo aggiuntivo."""
+
+PROMPT_C = """Sei un assistente dermatologico che valuta l'IDRATAZIONE superficiale e la PULIZIA globale
+della pelle del viso in una foto.
+
+Devi restituire ESCLUSIVAMENTE questo JSON:
+{
+  "disidratazione": ...,
+  "pelle_pulita_percent": ...
+}
+
+Definizioni:
+- Disidratazione = quanto la pelle appare secca, che tira, con micro-linee da secchezza,
+  opaca e priva di rimbalzo. Valore ALTO = pelle ben idratata (poca disidratazione).
+- Pelle pulita % = percezione globale di pelle libera da impurità visibili (sebo in eccesso,
+  sporco, make-up pesante non rimosso).
+
+Scala (0-100, 100 = situazione ideale):
+
+- Disidratazione:
+  90-100 = pelle visibilmente rimpolpata, liscia, con luminosità sana, nessuna micro-squama
+  75-89  = pelle generalmente idratata, lievi segni di secchezza in alcune aree
+  60-74  = disidratazione lieve-moderata (opacità, micro-linee da secchezza)
+  40-59  = pelle secca, evidenti aree ruvide/spente
+  0-39   = pelle molto disidratata, aspetto spento e ruvido
+
+- Pelle pulita percentuale:
+  90-100 = pelle molto pulita, senza film lucido eccessivo né residui visibili
+  75-89  = pelle pulita con leggero sebo naturale
+  60-74  = qualche zona lucida o leggermente congestionata
+  40-59  = numerose zone lucide/untuose o residui evidenti
+  0-39   = pelle poco pulita, sebo/impurità marcate
+
+Regole:
+- NON giudicare rughe, pori, macchie, occhiaie o acne: questi parametri sono già valutati altrove.
+- Concentrati sull'aspetto globale (luminosità diffusa, uniformità, sebo vs secchezza).
+- Usa solo numeri interi.
+- Rispondi SOLO con il JSON, senza testo aggiuntivo."""
+
+def call_groq(prompt, img_b64, seed, retries=2):
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            completion = client.chat.completions.create(
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                        ],
+                    }
+                ],
+                response_format={"type": "json_object"},
+                temperature=0,
+                seed=seed,
+            )
+            return json.loads(completion.choices[0].message.content)
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                import time
+                time.sleep(1)
+    raise last_error
 
 @app.get("/health")
 async def health():
-    return {"status": "online", "mode": "Maverick-Groq", "api_key": bool(os.environ.get("GROQ_API_KEY"))}
-
+    return {"status": "online", "mode": "Maverick-Groq-3call", "api_key": bool(os.environ.get("GROQ_API_KEY"))}
 
 @app.post("/analyze")
 @app.post("/analyze-dermoscope")
@@ -118,37 +191,31 @@ async def analyze(file: UploadFile = File(...)):
         img_b64, processed_bytes = prepare_image(img_bytes)
         seed = image_seed(processed_bytes)
 
-        completion = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": PROMPT},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-                    ],
-                }
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
-            seed=seed,
+        result_a = call_groq(PROMPT_A, img_b64, seed)
+        result_b = call_groq(PROMPT_B, img_b64, seed + 1)
+        result_c = call_groq(PROMPT_C, img_b64, seed + 2)
+
+        beauty_scores = {}
+        beauty_scores.update(result_a)
+        beauty_scores.update(result_b)
+        beauty_scores.update(result_c)
+
+        required_fields = ["rughe", "pori", "macchie", "occhiaie", "disidratazione", "acne", "pelle_pulita_percent"]
+        for field in required_fields:
+            if field not in beauty_scores:
+                beauty_scores[field] = 50
+            beauty_scores[field] = max(0, min(100, int(beauty_scores[field])))
+
+        ragionamento = (
+            f"Texture: rughe={beauty_scores['rughe']}, pori={beauty_scores['pori']}, acne={beauty_scores['acne']}. "
+            f"Colore: macchie={beauty_scores['macchie']}, occhiaie={beauty_scores['occhiaie']}. "
+            f"Idratazione: {beauty_scores['disidratazione']}. Salute generale: {beauty_scores['pelle_pulita_percent']}."
         )
 
-        analysis_result = json.loads(completion.choices[0].message.content)
-        required_fields = ["rughe", "pori", "macchie", "occhiaie", "disidratazione", "acne", "pelle_pulita_percent"]
-        if "beauty_scores" not in analysis_result:
-            analysis_result["beauty_scores"] = {}
-        for field in required_fields:
-            if field not in analysis_result["beauty_scores"]:
-                analysis_result["beauty_scores"][field] = 50
-        for field in required_fields:
-            val = analysis_result["beauty_scores"][field]
-            analysis_result["beauty_scores"][field] = max(0, min(100, int(val)))
-        return analysis_result
+        return {"beauty_scores": beauty_scores, "ragionamento": ragionamento}
 
     except Exception as e:
         return {"error": str(e), "status": "failed"}
-
 
 if __name__ == "__main__":
     import uvicorn
