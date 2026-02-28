@@ -15,7 +15,7 @@ from PIL import Image
 # CONFIGURAZIONE APP
 # ─────────────────────────────────────────────
 
-app = FastAPI(title="SkinAI - Perfect Corp Skin Analysis v4")
+app = FastAPI(title="SkinAI - Perfect Corp Skin Analysis v5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,31 +68,76 @@ def prepare_image(image_bytes: bytes) -> bytes:
         raise HTTPException(status_code=400, detail=f"Errore preparazione immagine: {e}")
 
 # ─────────────────────────────────────────────
-# PERFECT CORP API - WORKFLOW
+# PERFECT CORP API - WORKFLOW CORRETTO (3 STEP)
 # ─────────────────────────────────────────────
 
 def upload_file_and_get_id(image_bytes: bytes) -> str:
-    """Step 1: Carica l'immagine via multipart/form-data e ottiene il file_id."""
-    headers = {"Authorization": f"BearerAuthenticationV2 {PERFECT_CORP_API_KEY}"}
-    files = {"file": ("photo.jpg", image_bytes, "image/jpeg")}
+    """
+    Workflow corretto Perfect Corp v2.0:
+    Step 1: POST /file/skin-analysis con JSON metadata → riceve pre-signed URL S3 + file_id
+    Step 2: PUT del file binario al pre-signed URL S3
+    Restituisce il file_id da usare nel task.
+    """
+    headers = {
+        "Authorization": f"BearerAuthenticationV2 {PERFECT_CORP_API_KEY}",
+        "Content-Type": "application/json"
+    }
     url = f"{BASE_URL}/s2s/v2.0/file/skin-analysis"
 
+    # Step 1: Richiedi il pre-signed URL inviando i metadati del file
+    payload = {
+        "files": [
+            {
+                "content_type": "image/jpeg",
+                "file_name": "photo.jpg",
+                "file_size": len(image_bytes)
+            }
+        ]
+    }
+
     try:
-        resp = requests.post(url, headers=headers, files=files, timeout=30)
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        file_id = data.get("data", {}).get("files", [{}])[0].get("file_id")
+        file_info = data.get("data", {}).get("files", [{}])[0]
+        file_id = file_info.get("file_id")
+        upload_requests = file_info.get("requests", [])
+
         if not file_id:
-            raise ValueError("file_id non trovato nella risposta API")
-        return file_id
+            raise ValueError(f"file_id non trovato nella risposta API. Risposta: {data}")
+        if not upload_requests:
+            raise ValueError(f"upload URL non trovato nella risposta API. Risposta: {data}")
+
     except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Errore API (Upload): {e}")
+        raise HTTPException(status_code=502, detail=f"Errore API (Metadata Upload): {e}")
     except (ValueError, KeyError) as e:
-        raise HTTPException(status_code=500, detail=f"Errore parsing risposta API (Upload): {e}")
+        raise HTTPException(status_code=500, detail=f"Errore parsing risposta API (Metadata): {e}")
+
+    # Step 2: Carica il file binario al pre-signed URL S3 via PUT
+    upload_info = upload_requests[0]
+    upload_url = upload_info.get("url")
+    upload_headers = upload_info.get("headers", {})
+
+    # Assicura che i header abbiano Content-Type e Content-Length corretti
+    upload_headers["Content-Type"] = "image/jpeg"
+    upload_headers["Content-Length"] = str(len(image_bytes))
+
+    try:
+        put_resp = requests.put(
+            upload_url,
+            data=image_bytes,
+            headers=upload_headers,
+            timeout=60
+        )
+        put_resp.raise_for_status()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Errore upload file a S3: {e}")
+
+    return file_id
 
 
 def run_skin_analysis_task(file_id: str) -> str:
-    """Step 2: Avvia il task di analisi e ottiene il task_id."""
+    """Step 3: Avvia il task di analisi e ottiene il task_id."""
     headers = {
         "Authorization": f"BearerAuthenticationV2 {PERFECT_CORP_API_KEY}",
         "Content-Type": "application/json"
@@ -110,15 +155,16 @@ def run_skin_analysis_task(file_id: str) -> str:
         data = resp.json()
         task_id = data.get("data", {}).get("task_id")
         if not task_id:
-            raise ValueError("task_id non trovato nella risposta API")
+            raise ValueError(f"task_id non trovato nella risposta API. Risposta: {data}")
         return task_id
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Errore API (Run Task): {e}")
     except (ValueError, KeyError) as e:
         raise HTTPException(status_code=500, detail=f"Errore parsing risposta API (Run Task): {e}")
 
-def poll_for_result(task_id: str, max_wait: int = 60) -> dict:
-    """Step 3: Polling del risultato, download dello ZIP e estrazione di score_info.json."""
+
+def poll_for_result(task_id: str, max_wait: int = 90) -> dict:
+    """Step 4: Polling del risultato, download dello ZIP e estrazione di score_info.json."""
     headers = {"Authorization": f"BearerAuthenticationV2 {PERFECT_CORP_API_KEY}"}
     url = f"{BASE_URL}/s2s/v2.0/task/skin-analysis/{task_id}"
     deadline = time.time() + max_wait
@@ -134,7 +180,7 @@ def poll_for_result(task_id: str, max_wait: int = 60) -> dict:
                 zip_url = data.get("result_url")
                 if not zip_url:
                     raise ValueError("result_url non trovato nella risposta API")
-                
+
                 zip_resp = requests.get(zip_url, timeout=30)
                 zip_resp.raise_for_status()
 
@@ -148,11 +194,13 @@ def poll_for_result(task_id: str, max_wait: int = 60) -> dict:
             elif status == "failed":
                 raise HTTPException(status_code=500, detail=f"Task di analisi fallito: {data.get('error')}")
 
-            time.sleep(2) # Intervallo di polling
+            time.sleep(2)  # Intervallo di polling
 
         except requests.RequestException as e:
             raise HTTPException(status_code=502, detail=f"Errore API (Polling): {e}")
+
     raise HTTPException(status_code=408, detail=f"Timeout: Task {task_id} non completato entro {max_wait}s")
+
 
 # ─────────────────────────────────────────────
 # MAPPING PUNTEGGI
@@ -160,10 +208,9 @@ def poll_for_result(task_id: str, max_wait: int = 60) -> dict:
 
 def map_scores_to_frontend(score_info: dict) -> dict:
     """Mappa i punteggi HD di Perfect Corp ai nomi usati dal frontend."""
-    
+
     def get_score(key: str, default: int = 50) -> int:
         val = score_info.get(key, {})
-        # L'API può restituire direttamente il punteggio o un dizionario
         if isinstance(val, dict):
             raw = val.get("ui_score", val.get("raw_score", default))
         elif isinstance(val, (int, float)):
@@ -195,7 +242,8 @@ def map_scores_to_frontend(score_info: dict) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "engine": "perfect_corp_v4"}
+    return {"status": "ok", "engine": "perfect_corp_v5"}
+
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
@@ -206,7 +254,7 @@ async def analyze(file: UploadFile = File(...)):
     raw_bytes = await file.read()
     image_bytes = prepare_image(raw_bytes)
 
-    # 2. Esegui il workflow Perfect Corp
+    # 2. Esegui il workflow Perfect Corp (3 step)
     file_id = upload_file_and_get_id(image_bytes)
     task_id = run_skin_analysis_task(file_id)
     score_info = poll_for_result(task_id)
@@ -214,7 +262,7 @@ async def analyze(file: UploadFile = File(...)):
     # 3. Mappa i punteggi per il frontend
     beauty_scores = map_scores_to_frontend(score_info)
 
-    # 4. Crea un testo di "ragionamento" per il debug o la visualizzazione
+    # 4. Testo di ragionamento
     ragionamento = (
         f"Analisi Perfect Corp (HD): rughe={beauty_scores['rughe']}, "
         f"pori={beauty_scores['pori']}, macchie={beauty_scores['macchie']}, "
@@ -227,6 +275,7 @@ async def analyze(file: UploadFile = File(...)):
         "ragionamento": ragionamento,
         "raw_scores": score_info
     }
+
 
 # ─────────────────────────────────────────────
 # ESECUZIONE (per Railway)
