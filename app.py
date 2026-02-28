@@ -164,6 +164,12 @@ def do_perfect_corp_workflow(image_bytes: bytes, internal_task_id: str):
         tasks[internal_task_id]["error"] = str(e)
 
 
+def _run_in_thread(image_bytes: bytes, internal_task_id: str):
+    """Wrapper sincrono che esegue il workflow Perfect Corp in un thread del pool."""
+    future = executor.submit(do_perfect_corp_workflow, image_bytes, internal_task_id)
+    future.result()  # Attende il completamento nel thread
+
+
 # ─────────────────────────────────────────────
 # ENDPOINTS API
 # ─────────────────────────────────────────────
@@ -187,15 +193,9 @@ async def start_analysis(background_tasks: BackgroundTasks, file: UploadFile = F
         "created_at": time.time(),
     }
 
-    # Esegui il workflow in un thread separato (non blocca l'event loop)
-    loop = asyncio.get_event_loop()
-    background_tasks.add_task(
-        loop.run_in_executor,
-        executor,
-        do_perfect_corp_workflow,
-        image_bytes,
-        internal_task_id
-    )
+    # Esegui il workflow in un thread separato tramite BackgroundTasks
+    # Usiamo una funzione wrapper sincrona per compatibilità con Python 3.13
+    background_tasks.add_task(_run_in_thread, image_bytes, internal_task_id)
 
     return {
         "task_id": internal_task_id,
