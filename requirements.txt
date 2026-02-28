@@ -1,7 +1,5 @@
 fastapi
 uvicorn[standard]
-groq
-numpy
 python-multipart
 pillow
-opencv-python-headless
+requests
