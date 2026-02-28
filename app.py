@@ -1,16 +1,14 @@
 import os
-import base64
-import json
 import io
-import hashlib
-import numpy as np
-import cv2
-from PIL import Image, ImageFilter
+import time
+import zipfile
+import json
+import requests
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from groq import Groq
+from PIL import Image, ImageFilter
 
-app = FastAPI(title="SkinGlow AI - Hybrid CV+Groq v2")
+app = FastAPI(title="SkinAI - Perfect Corp Skin Analysis v3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,221 +17,182 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-
-MAX_IMAGE_SIZE = 1024
+PERFECT_CORP_API_KEY = os.environ.get("PERFECT_CORP_API_KEY")
+BASE_URL = "https://yce-api-01.makeupar.com"
+MAX_IMAGE_SIZE = 1920  # Perfect Corp supporta fino a 4096px, ma 1920 è ottimale
 
 
 # ─────────────────────────────────────────────
 # PREPARAZIONE IMMAGINE
 # ─────────────────────────────────────────────
 
-def prepare_image(image_bytes):
-    """Resize a max 1024px, sharpen, restituisce base64 + bytes processati."""
+def prepare_image(image_bytes: bytes) -> bytes:
+    """Ridimensiona l'immagine a max 1920px e la converte in JPEG."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
     if max(w, h) > MAX_IMAGE_SIZE:
         ratio = MAX_IMAGE_SIZE / max(w, h)
         img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
-    img = img.filter(ImageFilter.SHARPEN)
+    # Assicura che il lato corto sia >= 480px (requisito Perfect Corp SD)
+    min_side = min(img.size)
+    if min_side < 480:
+        ratio = 480 / min_side
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
     buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=85)
-    processed_bytes = buffer.getvalue()
-    return base64.b64encode(processed_bytes).decode('utf-8'), processed_bytes
-
-
-def image_seed(image_bytes):
-    return int(hashlib.md5(image_bytes).hexdigest()[:8], 16)
+    img.save(buffer, format="JPEG", quality=90)
+    return buffer.getvalue()
 
 
 # ─────────────────────────────────────────────
-# CV CLASSICO — SOLO PORI
+# PERFECT CORP API - 3 STEP WORKFLOW
 # ─────────────────────────────────────────────
 
-def cv_analyze_pori(image_bytes):
+def upload_file(image_bytes: bytes) -> str:
+    """Step 1: Carica l'immagine e ottieni il file_id."""
+    headers = {"X-API-KEY": PERFECT_CORP_API_KEY}
+    files = {"file": ("photo.jpg", image_bytes, "image/jpeg")}
+    resp = requests.post(f"{BASE_URL}/v1/file", headers=headers, files=files, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["data"]["file_id"]
+
+
+def run_skin_analysis(file_id: str) -> str:
+    """Step 2: Avvia il task di analisi della pelle e ottieni il task_id."""
+    headers = {
+        "X-API-KEY": PERFECT_CORP_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "file_id": file_id,
+        "enable_mask_overlay": False
+    }
+    resp = requests.post(
+        f"{BASE_URL}/v1/skin-analysis",
+        headers=headers,
+        json=payload,
+        timeout=30
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["data"]["task_id"]
+
+
+def poll_result(task_id: str, max_wait: int = 60) -> dict:
+    """Step 3: Polling finché il task è completato, poi scarica e legge lo ZIP."""
+    headers = {"X-API-KEY": PERFECT_CORP_API_KEY}
+    deadline = time.time() + max_wait
+
+    while time.time() < deadline:
+        resp = requests.get(
+            f"{BASE_URL}/v1/skin-analysis/{task_id}",
+            headers=headers,
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        status = data["data"].get("status")
+
+        if status == "done":
+            zip_url = data["data"]["result_url"]
+            zip_resp = requests.get(zip_url, timeout=30)
+            zip_resp.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as z:
+                # Il file score_info.json è dentro la cartella skinanalysisResult/
+                score_file = next(
+                    (f for f in z.namelist() if f.endswith("score_info.json")),
+                    None
+                )
+                if not score_file:
+                    raise ValueError("score_info.json non trovato nello ZIP")
+                with z.open(score_file) as f:
+                    return json.load(f)
+
+        elif status == "failed":
+            raise ValueError(f"Task fallito: {data}")
+
+        time.sleep(2)
+
+    raise TimeoutError(f"Task {task_id} non completato entro {max_wait}s")
+
+
+# ─────────────────────────────────────────────
+# MAPPING Perfect Corp → SkinAI scores
+# ─────────────────────────────────────────────
+
+def map_scores(score_info: dict) -> dict:
     """
-    Analisi CV classica per i pori usando Difference of Gaussians (DoG).
-    I pori dilatati creano micro-texture ad alta frequenza nella zona naso/guance.
-    Scala: 100 = pori quasi invisibili, 0 = pori molto dilatati.
-    
-    Calibrazione empirica su 3 foto di riferimento:
-    - dog_var ~64  → pori poco visibili → score ~83
-    - dog_var ~80  → pori poco visibili → score ~81
-    - dog_var ~162 → pori moderati      → score ~73
+    Mappa i punteggi Perfect Corp (1-100) ai parametri SkinAI.
+    Perfect Corp: 100 = pelle perfetta, 1 = pelle con problemi.
+    SkinAI usa la stessa scala: 100 = ottimo.
+
+    Per la disidratazione: Perfect Corp 'moisture' = 100 → molto idratata.
+    SkinAI 'disidratazione' = 100 → molto idratata (stessa direzione).
     """
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        return 70
+    def get(key: str, default: int = 50) -> int:
+        val = score_info.get(key, {})
+        if isinstance(val, dict):
+            raw = val.get("raw_score", val.get("ui_score", default))
+        elif isinstance(val, (int, float)):
+            raw = val
+        else:
+            raw = default
+        return max(0, min(100, int(raw)))
 
-    h, w = img_bgr.shape[:2]
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(float)
-
-    # Zona naso + guance centrali (35-70% altezza, 25-75% larghezza)
-    nose_top = int(h * 0.35)
-    nose_bot = int(h * 0.70)
-    nose_left = int(w * 0.25)
-    nose_right = int(w * 0.75)
-    nose_roi = gray[nose_top:nose_bot, nose_left:nose_right]
-    if nose_roi.size == 0:
-        nose_roi = gray
-
-    # Difference of Gaussians: cattura frequenze medie (pori, non rughe profonde)
-    blur_small = cv2.GaussianBlur(nose_roi, (3, 3), 0.8)
-    blur_large = cv2.GaussianBlur(nose_roi, (15, 15), 4)
-    dog = blur_small - blur_large
-    dog_var = dog.var()
-
-    # Calibrazione: dog_var bassa = pelle liscia/pori chiusi, alta = pori dilatati
-    pori_score = int(np.interp(dog_var, [0, 50, 200, 800, 2000], [95, 85, 70, 50, 30]))
-    return int(np.clip(pori_score, 10, 100))
-
-
-# ─────────────────────────────────────────────
-# GROQ — TUTTI I PARAMETRI TRANNE PORI
-# ─────────────────────────────────────────────
-
-PROMPT_GROQ = """Sei un dermatologo AI esperto. Analizza il viso nella foto.
-Valuta ESATTAMENTE questi 6 parametri dermatologici.
-NON valutare i pori (già analizzati separatamente con metodo strumentale).
-
-Restituisci ESCLUSIVAMENTE questo JSON, senza testo aggiuntivo:
-{
-    "rughe": <0-100>,
-    "macchie": <0-100>,
-    "occhiaie": <0-100>,
-    "disidratazione": <0-100>,
-    "acne": <0-100>,
-    "pelle_pulita_percent": <0-100>
-}
-
-SCALA (100 = perfetto/nessun problema, 0 = problema molto grave):
-
-RUGHE (linee di espressione, rughe profonde, solchi):
-  90-100 = nessuna ruga visibile, pelle liscia
-  75-89  = leggere linee di espressione (angoli occhi, fronte)
-  60-74  = rughe visibili su fronte, contorno occhi, naso-labbiale
-  40-59  = rughe marcate su più aree del viso
-  0-39   = rughe profonde e diffuse (solchi profondi, pelle molto segnata)
-
-MACCHIE (iperpigmentazione, discromie, macchie solari, melasma):
-  90-100 = tono uniforme, nessuna macchia visibile
-  75-89  = qualche piccola macchia isolata
-  60-74  = iperpigmentazione lieve-moderata
-  40-59  = macchie evidenti e diffuse
-  0-39   = iperpigmentazione marcata e molto diffusa
-
-OCCHIAIE (colorazione scura/bluastra/violacea sotto gli occhi):
-  90-100 = nessuna occhiaia, zona sotto gli occhi luminosa
-  75-89  = leggero scurimento sotto gli occhi
-  60-74  = occhiaie lievi ma visibili
-  40-59  = occhiaie moderate, colorazione evidente
-  0-39   = occhiaie marcate, colorazione scura/violacea intensa
-  IMPORTANTE: valuta SOLO la colorazione sotto gli occhi, non le rughe intorno.
-  La pelle anziana può avere occhiaie moderate (40-59) anche se il tono generale è scuro.
-
-DISIDRATAZIONE (secchezza, opacità, mancanza di luminosità):
-  90-100 = pelle luminosa, idratata, elastica
-  75-89  = pelle normalmente idratata
-  60-74  = lieve disidratazione, qualche zona opaca
-  40-59  = disidratazione moderata, pelle opaca
-  0-39   = pelle molto secca, opaca, micro-rughe da secchezza
-  IMPORTANTE: la pelle anziana con rughe profonde e aspetto opaco deve avere score 20-45.
-  La pelle giovane con aspetto luminoso deve avere score 70-90.
-
-ACNE (lesioni attive, brufoli, papule, pustole, infiammazioni):
-  90-100 = nessuna lesione attiva, pelle pulita
-  75-89  = poche lesioni isolate o comedoni
-  60-74  = acne lieve-moderata
-  40-59  = acne moderata-severa
-  0-39   = acne severa con molte lesioni attive
-
-PELLE PULITA %:
-  90-100 = pelle molto pulita, senza sebo eccessivo
-  75-89  = pelle pulita con leggero sebo naturale
-  60-74  = qualche zona lucida o congestionata
-  40-59  = numerose zone lucide o residui evidenti
-  0-39   = pelle poco pulita, sebo marcato
-
-Usa SOLO numeri interi. La stessa immagine deve produrre SEMPRE gli stessi punteggi."""
-
-
-def call_groq(img_b64, seed, retries=2):
-    last_error = None
-    for attempt in range(retries + 1):
-        try:
-            completion = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": PROMPT_GROQ},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-                        ],
-                    }
-                ],
-                response_format={"type": "json_object"},
-                temperature=0,
-                seed=seed,
-            )
-            return json.loads(completion.choices[0].message.content)
-        except Exception as e:
-            last_error = e
-            if attempt < retries:
-                import time
-                time.sleep(1)
-    raise last_error
-
-
-# ─────────────────────────────────────────────
-# ENDPOINTS
-# ─────────────────────────────────────────────
-
-@app.get("/health")
-async def health():
     return {
-        "status": "online",
-        "mode": "Hybrid-CV(pori)+Groq(6params) v2",
-        "api_key": bool(os.environ.get("GROQ_API_KEY"))
+        "rughe": get("wrinkle"),
+        "pori": get("pore"),
+        "macchie": get("age_spot"),
+        "occhiaie": get("dark_circle_v2"),
+        "disidratazione": get("moisture"),
+        "acne": get("acne"),
+        "pelle_pulita_percent": get("all"),
+        # Parametri bonus Perfect Corp
+        "radiance": get("radiance"),
+        "firmness": get("firmness"),
+        "oiliness": get("oiliness"),
+        "texture": get("texture"),
+        "redness": get("redness"),
+        "skin_age": score_info.get("skin_age", None),
     }
 
 
+# ─────────────────────────────────────────────
+# ENDPOINT
+# ─────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "engine": "perfect_corp_v3"}
+
+
 @app.post("/analyze")
-@app.post("/analyze-dermoscope")
 async def analyze(file: UploadFile = File(...)):
     try:
-        img_bytes = await file.read()
+        if not PERFECT_CORP_API_KEY:
+            return {"error": "PERFECT_CORP_API_KEY non configurata", "status": "failed"}
 
-        # 1. Prepara immagine (resize + sharpen)
-        img_b64, processed_bytes = prepare_image(img_bytes)
+        # 1. Leggi e prepara l'immagine
+        raw_bytes = await file.read()
+        image_bytes = prepare_image(raw_bytes)
 
-        # 2. Seed deterministico sull'immagine processata
-        seed = image_seed(processed_bytes)
+        # 2. Upload
+        file_id = upload_file(image_bytes)
 
-        # 3. CV classico per SOLI PORI (calibrato e testato)
-        pori_score = cv_analyze_pori(processed_bytes)
+        # 3. Avvia analisi
+        task_id = run_skin_analysis(file_id)
 
-        # 4. Groq per rughe, macchie, occhiaie, disidratazione, acne, pelle_pulita_percent
-        groq_scores = call_groq(img_b64, seed)
+        # 4. Polling risultato
+        score_info = poll_result(task_id)
 
-        # 5. Merge risultati
-        beauty_scores = {}
-        beauty_scores.update(groq_scores)
-        beauty_scores["pori"] = pori_score  # Override con CV (più accurato)
-
-        # 6. Validazione e clamp 0-100
-        required_fields = ["rughe", "pori", "macchie", "occhiaie", "disidratazione", "acne", "pelle_pulita_percent"]
-        for field in required_fields:
-            if field not in beauty_scores:
-                beauty_scores[field] = 50
-            beauty_scores[field] = max(0, min(100, int(beauty_scores[field])))
+        # 5. Mapping punteggi
+        beauty_scores = map_scores(score_info)
 
         ragionamento = (
-            f"CV(pori)={beauty_scores['pori']}. "
-            f"AI: rughe={beauty_scores['rughe']}, macchie={beauty_scores['macchie']}, "
-            f"occhiaie={beauty_scores['occhiaie']}, disidratazione={beauty_scores['disidratazione']}, "
-            f"acne={beauty_scores['acne']}, pelle_pulita={beauty_scores['pelle_pulita_percent']}."
+            f"Perfect Corp AI: rughe={beauty_scores['rughe']}, "
+            f"pori={beauty_scores['pori']}, macchie={beauty_scores['macchie']}, "
+            f"occhiaie={beauty_scores['occhiaie']}, idratazione={beauty_scores['disidratazione']}, "
+            f"acne={beauty_scores['acne']}, salute={beauty_scores['pelle_pulita_percent']}."
         )
 
         return {
