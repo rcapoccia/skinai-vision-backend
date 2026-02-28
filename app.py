@@ -163,7 +163,7 @@ def run_skin_analysis_task(file_id: str) -> str:
         raise HTTPException(status_code=500, detail=f"Errore parsing risposta API (Run Task): {e}")
 
 
-def poll_for_result(task_id: str, max_wait: int = 90) -> dict:
+def poll_for_result(task_id: str, max_wait: int = 180) -> dict:
     """Step 4: Polling del risultato, download dello ZIP e estrazione di score_info.json."""
     headers = {"Authorization": f"Bearer {PERFECT_CORP_API_KEY}"}
     url = f"{BASE_URL}/s2s/v2.0/task/skin-analysis/{task_id}"
