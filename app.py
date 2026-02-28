@@ -7,9 +7,6 @@ import time
 import uuid
 import zipfile
 import json
-import asyncio
-import requests
-from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,9 +20,6 @@ app = FastAPI(title="SkinAI - Perfect Corp Skin Analysis v6")
 
 # Storage in-memory per i task (adatto per Railway free/hobby tier con 1 worker)
 tasks: Dict[str, Dict[str, Any]] = {}
-
-# Thread pool per le chiamate HTTP sincrone (requests) dentro coroutine async
-executor = ThreadPoolExecutor(max_workers=4)
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,7 +44,7 @@ DST_ACTIONS_HD = [
 ]
 
 # ─────────────────────────────────────────────
-# FUNZIONI HELPER (sincrone, girano nel thread pool)
+# FUNZIONI HELPER
 # ─────────────────────────────────────────────
 
 def prepare_image(image_bytes: bytes) -> bytes:
@@ -71,9 +65,12 @@ def prepare_image(image_bytes: bytes) -> bytes:
 
 def do_perfect_corp_workflow(image_bytes: bytes, internal_task_id: str):
     """
-    Esegue l'intero workflow Perfect Corp in modo sincrono (gira in un thread separato).
-    Aggiorna il dizionario tasks con lo stato e il risultato.
+    Esegue l'intero workflow Perfect Corp in modo sincrono.
+    Viene chiamata da BackgroundTasks che la esegue in un threadpool interno
+    DOPO aver inviato la risposta HTTP → nessun timeout Railway.
     """
+    import requests
+
     try:
         # 1. Prepara immagine
         tasks[internal_task_id]["perfect_status"] = "preparing_image"
@@ -85,7 +82,7 @@ def do_perfect_corp_workflow(image_bytes: bytes, internal_task_id: str):
             "Content-Type": "application/json"
         }
 
-        # 2. Ottieni pre-signed URL
+        # 2. Ottieni pre-signed URL da Perfect Corp
         tasks[internal_task_id]["perfect_status"] = "getting_presigned_url"
         payload_file = {
             "files": [{
@@ -106,7 +103,7 @@ def do_perfect_corp_workflow(image_bytes: bytes, internal_task_id: str):
         upload_url = d1["data"]["files"][0]["requests"][0]["url"]
         upload_headers = dict(d1["data"]["files"][0]["requests"][0].get("headers", {}))
 
-        # 3. Upload su S3
+        # 3. Upload binario su S3
         tasks[internal_task_id]["perfect_status"] = "uploading_to_s3"
         upload_headers["Content-Type"] = "image/jpeg"
         r2 = requests.put(upload_url, headers=upload_headers, data=prepared, timeout=60)
@@ -160,14 +157,9 @@ def do_perfect_corp_workflow(image_bytes: bytes, internal_task_id: str):
 
     except Exception as e:
         print(f"[ERRORE] Task {internal_task_id}: {e}")
-        tasks[internal_task_id]["status"] = "failed"
-        tasks[internal_task_id]["error"] = str(e)
-
-
-def _run_in_thread(image_bytes: bytes, internal_task_id: str):
-    """Wrapper sincrono che esegue il workflow Perfect Corp in un thread del pool."""
-    future = executor.submit(do_perfect_corp_workflow, image_bytes, internal_task_id)
-    future.result()  # Attende il completamento nel thread
+        if internal_task_id in tasks:
+            tasks[internal_task_id]["status"] = "failed"
+            tasks[internal_task_id]["error"] = str(e)
 
 
 # ─────────────────────────────────────────────
@@ -193,9 +185,9 @@ async def start_analysis(background_tasks: BackgroundTasks, file: UploadFile = F
         "created_at": time.time(),
     }
 
-    # Esegui il workflow in un thread separato tramite BackgroundTasks
-    # Usiamo una funzione wrapper sincrona per compatibilità con Python 3.13
-    background_tasks.add_task(_run_in_thread, image_bytes, internal_task_id)
+    # FastAPI esegue automaticamente le funzioni sincrone in un threadpool interno
+    # DOPO aver inviato la risposta HTTP → fire-and-forget, nessun timeout Railway
+    background_tasks.add_task(do_perfect_corp_workflow, image_bytes, internal_task_id)
 
     return {
         "task_id": internal_task_id,
@@ -217,9 +209,27 @@ async def get_result(task_id: str):
     elif status == "failed":
         return {"status": "failed", "error": task.get("error", "Errore sconosciuto")}
     else:
+        # Auto-cleanup task scaduti (>10 minuti)
+        if time.time() - task["created_at"] > 600:
+            del tasks[task_id]
+            raise HTTPException(status_code=404, detail="Task scaduto")
         return {
             "status": status,
             "perfect_status": task.get("perfect_status", "pending"),
             "elapsed_time": round(time.time() - task["created_at"], 1),
             "message": "Analisi in corso, riprova tra 5 secondi..."
         }
+
+
+@app.delete("/result/{task_id}")
+async def cleanup_task(task_id: str):
+    """Elimina un task dalla memoria dopo che il frontend ha ricevuto il risultato."""
+    if task_id in tasks:
+        del tasks[task_id]
+    return {"deleted": True}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
