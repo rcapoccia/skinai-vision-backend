@@ -79,7 +79,7 @@ def upload_file_and_get_id(image_bytes: bytes) -> str:
     Restituisce il file_id da usare nel task.
     """
     headers = {
-        "Authorization": f"BearerAuthenticationV2 {PERFECT_CORP_API_KEY}",
+        "Authorization": f"Bearer {PERFECT_CORP_API_KEY}",
         "Content-Type": "application/json"
     }
     url = f"{BASE_URL}/s2s/v2.0/file/skin-analysis"
@@ -139,7 +139,7 @@ def upload_file_and_get_id(image_bytes: bytes) -> str:
 def run_skin_analysis_task(file_id: str) -> str:
     """Step 3: Avvia il task di analisi e ottiene il task_id."""
     headers = {
-        "Authorization": f"BearerAuthenticationV2 {PERFECT_CORP_API_KEY}",
+        "Authorization": f"Bearer {PERFECT_CORP_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
@@ -165,7 +165,7 @@ def run_skin_analysis_task(file_id: str) -> str:
 
 def poll_for_result(task_id: str, max_wait: int = 90) -> dict:
     """Step 4: Polling del risultato, download dello ZIP e estrazione di score_info.json."""
-    headers = {"Authorization": f"BearerAuthenticationV2 {PERFECT_CORP_API_KEY}"}
+    headers = {"Authorization": f"Bearer {PERFECT_CORP_API_KEY}"}
     url = f"{BASE_URL}/s2s/v2.0/task/skin-analysis/{task_id}"
     deadline = time.time() + max_wait
 
