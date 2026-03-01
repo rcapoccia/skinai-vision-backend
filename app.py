@@ -3,12 +3,14 @@ import base64
 import json
 import io
 import hashlib
+import numpy as np
+import cv2
 from PIL import Image, ImageFilter
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 
-app = FastAPI(title="SkinGlow AI - Maverick-Groq")
+app = FastAPI(title="SkinGlow AI - Maverick-Groq-OpenCV")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,19 +21,57 @@ app.add_middleware(
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
+# Haar Cascade for face detection (bundled with OpenCV, no extra deps)
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
 MAX_IMAGE_SIZE = 1024
 
-def prepare_image(image_bytes):
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    w, h = img.size
+def prepare_image_opencv(image_bytes):
+    # 1. Decode to OpenCV format (RGB)
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+
+    # 2. Face detection and crop with padding
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
+    if len(faces) > 0:
+        x, y, w, h = faces[0]
+        ih, iw = img_cv.shape[:2]
+        pad_w = int(w * 0.25)
+        pad_h = int(h * 0.25)
+        x1 = max(0, x - pad_w)
+        y1 = max(0, y - pad_h)
+        x2 = min(iw, x + w + pad_w)
+        y2 = min(ih, y + h + pad_h)
+        img_cv = img_cv[y1:y2, x1:x2]
+
+    # 3. CLAHE for uniform illumination (applied on L channel of LAB)
+    lab = cv2.cvtColor(img_cv, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    img_cv = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2RGB)
+
+    # 4. Gamma correction (brighten slightly for better detail visibility)
+    gamma = 1.2
+    inv_gamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], dtype="uint8")
+    img_cv = cv2.LUT(img_cv, table)
+
+    # 5. Convert to PIL, resize to max 1024px, sharpen, encode to JPEG
+    img_pil = Image.fromarray(img_cv)
+    w, h = img_pil.size
     if max(w, h) > MAX_IMAGE_SIZE:
         ratio = MAX_IMAGE_SIZE / max(w, h)
-        img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
-    img = img.filter(ImageFilter.SHARPEN)
+        img_pil = img_pil.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+    img_pil = img_pil.filter(ImageFilter.SHARPEN)
+
     buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=85)
+    img_pil.save(buffer, format="JPEG", quality=85)
     processed_bytes = buffer.getvalue()
-    return base64.b64encode(processed_bytes).decode('utf-8'), processed_bytes
+
+    return base64.b64encode(processed_bytes).decode("utf-8"), processed_bytes
 
 def image_seed(image_bytes):
     return int(hashlib.md5(image_bytes).hexdigest()[:8], 16)
@@ -181,14 +221,14 @@ def call_groq(prompt, img_b64, seed, retries=2):
 
 @app.get("/health")
 async def health():
-    return {"status": "online", "mode": "Maverick-Groq-3call", "api_key": bool(os.environ.get("GROQ_API_KEY"))}
+    return {"status": "online", "mode": "Maverick-Groq-OpenCV", "api_key": bool(os.environ.get("GROQ_API_KEY"))}
 
 @app.post("/analyze")
 @app.post("/analyze-dermoscope")
 async def analyze(file: UploadFile = File(...)):
     try:
         img_bytes = await file.read()
-        img_b64, processed_bytes = prepare_image(img_bytes)
+        img_b64, processed_bytes = prepare_image_opencv(img_bytes)
         seed = image_seed(processed_bytes)
 
         result_a = call_groq(PROMPT_A, img_b64, seed)
